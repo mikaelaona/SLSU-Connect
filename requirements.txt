@@ -1,4 +1,4 @@
-Flask==3.0.3
-Werkzeug==3.0.4
-psycopg2-binary==2.9.9 ; only if using PostgreSQL
-tzdata==2024.3  ; required on Windows, optional on Linux/macOS
+Flask==3.1.2
+gunicorn==23.0.0
+Werkzeug==3.1.3
+psycopg2-binary==2.9.10
