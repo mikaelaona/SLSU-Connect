@@ -1,318 +1,902 @@
-from flask import Flask, render_template, request, jsonify, session
-import firebase_admin
-from firebase_admin import credentials, db
+from flask import Flask, render_template, request, redirect, url_for, session, flash
+from werkzeug.security import generate_password_hash, check_password_hash
+import sqlite3
+import secrets
+import string
 import os
-from dotenv import load_dotenv
-import uuid
-
-# Load environment variables
-load_dotenv()
 
 app = Flask(__name__)
-app.secret_key = os.getenv("SECRET_KEY", "dev-secret-key-change-in-production")
 
-# Initialize Firebase
-if not firebase_admin._apps:
-    cred = credentials.Certificate({
-        "type": "service_account",
-        "project_id": os.getenv("FIREBASE_PROJECT_ID"),
-        "private_key_id": os.getenv("FIREBASE_PRIVATE_KEY_ID"),
-        "private_key": os.getenv("FIREBASE_PRIVATE_KEY", "").replace("\\n", "\n"),
-        "client_email": os.getenv("FIREBASE_CLIENT_EMAIL"),
-        "client_id": os.getenv("FIREBASE_CLIENT_ID"),
-        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-        "token_uri": "https://oauth2.googleapis.com/token",
-        "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-        "client_x509_cert_url": os.getenv("FIREBASE_CLIENT_X509_CERT_URL")
-    })
-    firebase_admin.initialize_app(cred, {
-        "databaseURL": os.getenv("FIREBASE_DATABASE_URL")
-    })
+app.secret_key = os.environ.get(
+    "SECRET_KEY",
+    "change-this-secret-key"
+)
 
-ref = db.reference()
+DATABASE = "study_sched.db"
 
-# Helper: Generate group code
-def gen_group_code():
-    return f"JGE-{uuid.uuid4().hex[:4].upper()}"
 
-# Serve main page
+# =========================
+# DATABASE
+# =========================
+
+def get_db():
+    connection = sqlite3.connect(DATABASE)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def init_db():
+    db = get_db()
+
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS students (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS schedules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            subject TEXT,
+            date TEXT NOT NULL,
+            start_time TEXT,
+            end_time TEXT,
+            FOREIGN KEY(student_id) REFERENCES students(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS deadlines (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT,
+            due_date TEXT NOT NULL,
+            completed INTEGER DEFAULT 0,
+            FOREIGN KEY(student_id) REFERENCES students(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            code TEXT UNIQUE NOT NULL,
+            owner_id INTEGER NOT NULL,
+            FOREIGN KEY(owner_id) REFERENCES students(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS group_members (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id INTEGER NOT NULL,
+            student_id INTEGER NOT NULL,
+            UNIQUE(group_id, student_id),
+            FOREIGN KEY(group_id) REFERENCES groups(id),
+            FOREIGN KEY(student_id) REFERENCES students(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS group_tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT,
+            due_date TEXT,
+            completed INTEGER DEFAULT 0,
+            FOREIGN KEY(group_id) REFERENCES groups(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS reviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            content TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(student_id) REFERENCES students(id)
+        );
+    """)
+
+    db.commit()
+    db.close()
+
+
+# =========================
+# LOGIN CHECK
+# =========================
+
+def login_required():
+    return "student_id" in session
+
+
+# =========================
+# HOME
+# =========================
+
 @app.route("/")
-def index():
-    return render_template("index.html")
+def home():
+    if login_required():
+        return redirect(url_for("dashboard"))
 
-# --- Auth Endpoints ---
-@app.route("/api/signup", methods=["POST"])
-def signup():
-    data = request.json
-    users_ref = ref.child("users")
-    
-    snapshot = users_ref.order_by_child("email").equal_to(data["email"]).get()
-    if snapshot:
-        return jsonify({"error": "Email already registered"}), 400
-    
-    user_id = str(uuid.uuid4())
-    new_user = {
-        "id": user_id,
-        "name": data["name"],
-        "email": data["email"],
-        "password": data["password"],
-        "schedule": [],
-        "deadlines": [],
-        "joinedGroupCodes": [],
-        "reviewers": []
-    }
-    
-    users_ref.child(user_id).set(new_user)
-    session["user_id"] = user_id
-    return jsonify({"user": new_user})
+    return redirect(url_for("login"))
 
-@app.route("/api/login", methods=["POST"])
+
+# =========================
+# REGISTER
+# =========================
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+
+    if request.method == "POST":
+
+        name = request.form["name"].strip()
+        email = request.form["email"].strip().lower()
+        password = request.form["password"]
+
+        if not name or not email or not password:
+            flash("Please complete all fields.")
+            return redirect(url_for("register"))
+
+        if len(password) < 6:
+            flash("Password must be at least 6 characters.")
+            return redirect(url_for("register"))
+
+        db = get_db()
+
+        existing = db.execute(
+            "SELECT id FROM students WHERE email = ?",
+            (email,)
+        ).fetchone()
+
+        if existing:
+            db.close()
+            flash("An account with that email already exists.")
+            return redirect(url_for("register"))
+
+        hashed_password = generate_password_hash(password)
+
+        cursor = db.execute(
+            """
+            INSERT INTO students
+            (name, email, password)
+            VALUES (?, ?, ?)
+            """,
+            (name, email, hashed_password)
+        )
+
+        db.commit()
+
+        student_id = cursor.lastrowid
+
+        db.close()
+
+        session["student_id"] = student_id
+        session["student_name"] = name
+
+        return redirect(url_for("dashboard"))
+
+    return render_template("register.html")
+
+
+# =========================
+# LOGIN
+# =========================
+
+@app.route("/login", methods=["GET", "POST"])
 def login():
-    data = request.json
-    users_ref = ref.child("users")
-    snapshot = users_ref.order_by_child("email").equal_to(data["email"]).get()
-    
-    if not snapshot:
-        return jsonify({"error": "User not found"}), 404
-    
-    for uid, user in snapshot.items():
-        if user["password"] == data["password"]:
-            session["user_id"] = uid
-            return jsonify({"user": user})
-    
-    return jsonify({"error": "Invalid credentials"}), 401
 
-@app.route("/api/me", methods=["GET"])
-def get_me():
-    if "user_id" not in session:
-        return jsonify({"error": "Not logged in"}), 401
-    user = ref.child("users").child(session["user_id"]).get()
-    return jsonify(dict(user)) if user else jsonify({"error": "Not found"}), 404
+    if request.method == "POST":
 
-@app.route("/api/logout", methods=["POST"])
+        email = request.form["email"].strip().lower()
+        password = request.form["password"]
+
+        db = get_db()
+
+        student = db.execute(
+            "SELECT * FROM students WHERE email = ?",
+            (email,)
+        ).fetchone()
+
+        db.close()
+
+        if not student:
+            flash("Invalid email or password.")
+            return redirect(url_for("login"))
+
+        if not check_password_hash(student["password"], password):
+            flash("Invalid email or password.")
+            return redirect(url_for("login"))
+
+        session["student_id"] = student["id"]
+        session["student_name"] = student["name"]
+
+        return redirect(url_for("dashboard"))
+
+    return render_template("login.html")
+
+
+# =========================
+# LOGOUT
+# =========================
+
+@app.route("/logout")
 def logout():
+
     session.clear()
-    return jsonify({"ok": True})
 
-# --- Schedule ---
-@app.route("/api/schedule", methods=["GET", "POST", "DELETE"])
+    return redirect(url_for("login"))
+
+
+# =========================
+# DASHBOARD
+# =========================
+
+@app.route("/dashboard")
+def dashboard():
+
+    if not login_required():
+        return redirect(url_for("login"))
+
+    student_id = session["student_id"]
+
+    db = get_db()
+
+    schedules = db.execute(
+        """
+        SELECT *
+        FROM schedules
+        WHERE student_id = ?
+        ORDER BY date, start_time
+        LIMIT 5
+        """,
+        (student_id,)
+    ).fetchall()
+
+    deadlines = db.execute(
+        """
+        SELECT *
+        FROM deadlines
+        WHERE student_id = ?
+        AND completed = 0
+        ORDER BY due_date
+        LIMIT 5
+        """,
+        (student_id,)
+    ).fetchall()
+
+    groups = db.execute(
+        """
+        SELECT groups.*
+        FROM groups
+        JOIN group_members
+        ON groups.id = group_members.group_id
+        WHERE group_members.student_id = ?
+        """,
+        (student_id,)
+    ).fetchall()
+
+    db.close()
+
+    return render_template(
+        "dashboard.html",
+        schedules=schedules,
+        deadlines=deadlines,
+        groups=groups
+    )
+
+
+# =========================
+# SCHEDULE
+# =========================
+
+@app.route("/schedule", methods=["GET", "POST"])
 def schedule():
-    if "user_id" not in session:
-        return jsonify({"error": "Unauthorized"}), 401
-    uref = ref.child("users").child(session["user_id"])
-    
-    if request.method == "GET":
-        sched = uref.child("schedule").get() or []
-        return jsonify(list(sched) if isinstance(sched, list) else [])
-    
-    if request.method == "POST":
-        data = request.json
-        sched = uref.child("schedule").get() or []
-        sched.append(data)
-        uref.child("schedule").set(sched)
-        return jsonify(data)
-    
-    if request.method == "DELETE":
-        idx = request.json["index"]
-        sched = uref.child("schedule").get() or []
-        if 0 <= idx < len(sched):
-            sched.pop(idx)
-            uref.child("schedule").set(sched)
-        return jsonify({"ok": True})
 
-# --- Deadlines ---
-@app.route("/api/deadlines", methods=["GET", "POST", "DELETE"])
+    if not login_required():
+        return redirect(url_for("login"))
+
+    student_id = session["student_id"]
+
+    db = get_db()
+
+    if request.method == "POST":
+
+        title = request.form["title"]
+        subject = request.form["subject"]
+        date = request.form["date"]
+        start_time = request.form["start_time"]
+        end_time = request.form["end_time"]
+
+        db.execute(
+            """
+            INSERT INTO schedules
+            (student_id, title, subject, date, start_time, end_time)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                student_id,
+                title,
+                subject,
+                date,
+                start_time,
+                end_time
+            )
+        )
+
+        db.commit()
+
+        db.close()
+
+        return redirect(url_for("schedule"))
+
+    schedules = db.execute(
+        """
+        SELECT *
+        FROM schedules
+        WHERE student_id = ?
+        ORDER BY date, start_time
+        """,
+        (student_id,)
+    ).fetchall()
+
+    db.close()
+
+    return render_template(
+        "schedule.html",
+        schedules=schedules
+    )
+
+
+@app.route("/schedule/delete/<int:schedule_id>")
+def delete_schedule(schedule_id):
+
+    if not login_required():
+        return redirect(url_for("login"))
+
+    db = get_db()
+
+    db.execute(
+        """
+        DELETE FROM schedules
+        WHERE id = ?
+        AND student_id = ?
+        """,
+        (
+            schedule_id,
+            session["student_id"]
+        )
+    )
+
+    db.commit()
+    db.close()
+
+    return redirect(url_for("schedule"))
+
+
+# =========================
+# DEADLINES
+# =========================
+
+@app.route("/deadlines", methods=["GET", "POST"])
 def deadlines():
-    if "user_id" not in session:
-        return jsonify({"error": "Unauthorized"}), 401
-    uref = ref.child("users").child(session["user_id"])
-    
-    if request.method == "GET":
-        dls = uref.child("deadlines").get() or []
-        return jsonify(list(dls) if isinstance(dls, list) else [])
-    
-    if request.method == "POST":
-        data = request.json
-        dls = uref.child("deadlines").get() or []
-        dls.append(data)
-        uref.child("deadlines").set(dls)
-        return jsonify(data)
-    
-    if request.method == "DELETE":
-        idx = request.json["index"]
-        dls = uref.child("deadlines").get() or []
-        if 0 <= idx < len(dls):
-            dls.pop(idx)
-            uref.child("deadlines").set(dls)
-        return jsonify({"ok": True})
 
-# --- Reviewers ---
-@app.route("/api/reviewers", methods=["GET", "POST", "DELETE"])
-def reviewers():
-    if "user_id" not in session:
-        return jsonify({"error": "Unauthorized"}), 401
-    uref = ref.child("users").child(session["user_id"])
-    
-    if request.method == "GET":
-        rv = uref.child("reviewers").get() or []
-        return jsonify(list(rv) if isinstance(rv, list) else [])
-    
-    if request.method == "POST":
-        data = request.json
-        rv = uref.child("reviewers").get() or []
-        rv.append(data)
-        uref.child("reviewers").set(rv)
-        return jsonify(data)
-    
-    if request.method == "DELETE":
-        idx = request.json["index"]
-        rv = uref.child("reviewers").get() or []
-        if 0 <= idx < len(rv):
-            rv.pop(idx)
-            uref.child("reviewers").set(rv)
-        return jsonify({"ok": True})
+    if not login_required():
+        return redirect(url_for("login"))
 
-# --- Groups ---
-@app.route("/api/groups/create", methods=["POST"])
+    student_id = session["student_id"]
+
+    db = get_db()
+
+    if request.method == "POST":
+
+        title = request.form["title"]
+        description = request.form["description"]
+        due_date = request.form["due_date"]
+
+        db.execute(
+            """
+            INSERT INTO deadlines
+            (student_id, title, description, due_date)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                student_id,
+                title,
+                description,
+                due_date
+            )
+        )
+
+        db.commit()
+
+        db.close()
+
+        return redirect(url_for("deadlines"))
+
+    deadlines_list = db.execute(
+        """
+        SELECT *
+        FROM deadlines
+        WHERE student_id = ?
+        ORDER BY due_date
+        """,
+        (student_id,)
+    ).fetchall()
+
+    db.close()
+
+    return render_template(
+        "deadlines.html",
+        deadlines=deadlines_list
+    )
+
+
+@app.route("/deadlines/complete/<int:deadline_id>")
+def complete_deadline(deadline_id):
+
+    if not login_required():
+        return redirect(url_for("login"))
+
+    db = get_db()
+
+    db.execute(
+        """
+        UPDATE deadlines
+        SET completed = CASE
+            WHEN completed = 0 THEN 1
+            ELSE 0
+        END
+        WHERE id = ?
+        AND student_id = ?
+        """,
+        (
+            deadline_id,
+            session["student_id"]
+        )
+    )
+
+    db.commit()
+    db.close()
+
+    return redirect(url_for("deadlines"))
+
+
+# =========================
+# GROUP CODE
+# =========================
+
+def generate_group_code():
+
+    characters = string.ascii_uppercase + string.digits
+
+    return "".join(
+        secrets.choice(characters)
+        for _ in range(8)
+    )
+
+
+# =========================
+# GROUPS
+# =========================
+
+@app.route("/groups", methods=["GET", "POST"])
+def groups():
+
+    if not login_required():
+        return redirect(url_for("login"))
+
+    student_id = session["student_id"]
+
+    db = get_db()
+
+    groups_list = db.execute(
+        """
+        SELECT groups.*
+        FROM groups
+        JOIN group_members
+        ON groups.id = group_members.group_id
+        WHERE group_members.student_id = ?
+        """,
+        (student_id,)
+    ).fetchall()
+
+    db.close()
+
+    return render_template(
+        "groups.html",
+        groups=groups_list
+    )
+
+
+# =========================
+# CREATE GROUP
+# =========================
+
+@app.route("/groups/create", methods=["POST"])
 def create_group():
-    if "user_id" not in session:
-        return jsonify({"error": "Unauthorized"}), 401
-    user = ref.child("users").child(session["user_id"]).get()
-    data = request.json
-    code = gen_group_code()
-    
-    group = {
-        "code": code,
-        "name": data["name"],
-        "members": [{"name": user["name"], "email": user["email"]}],
-        "tasks": [],
-        "logs": [f"Group created by {user['name']}"]
-    }
-    
-    ref.child("groups").child(code).set(group)
-    
-    codes = user.get("joinedGroupCodes", [])
-    codes.append(code)
-    ref.child("users").child(session["user_id"]).child("joinedGroupCodes").set(codes)
-    
-    return jsonify({"code": code, "name": data["name"]})
 
-@app.route("/api/groups/join", methods=["POST"])
+    if not login_required():
+        return redirect(url_for("login"))
+
+    name = request.form["name"]
+
+    db = get_db()
+
+    while True:
+
+        code = generate_group_code()
+
+        existing = db.execute(
+            "SELECT id FROM groups WHERE code = ?",
+            (code,)
+        ).fetchone()
+
+        if not existing:
+            break
+
+    cursor = db.execute(
+        """
+        INSERT INTO groups
+        (name, code, owner_id)
+        VALUES (?, ?, ?)
+        """,
+        (
+            name,
+            code,
+            session["student_id"]
+        )
+    )
+
+    group_id = cursor.lastrowid
+
+    db.execute(
+        """
+        INSERT INTO group_members
+        (group_id, student_id)
+        VALUES (?, ?)
+        """,
+        (
+            group_id,
+            session["student_id"]
+        )
+    )
+
+    db.commit()
+    db.close()
+
+    flash(f"Group created! Your group code is {code}")
+
+    return redirect(url_for("groups"))
+
+
+# =========================
+# JOIN GROUP
+# =========================
+
+@app.route("/groups/join", methods=["POST"])
 def join_group():
-    if "user_id" not in session:
-        return jsonify({"error": "Unauthorized"}), 401
-    user = ref.child("users").child(session["user_id"]).get()
-    code = request.json["code"].upper()
-    
-    gref = ref.child("groups").child(code)
-    group = gref.get()
+
+    if not login_required():
+        return redirect(url_for("login"))
+
+    code = request.form["code"].strip().upper()
+
+    db = get_db()
+
+    group = db.execute(
+        """
+        SELECT *
+        FROM groups
+        WHERE code = ?
+        """,
+        (code,)
+    ).fetchone()
+
     if not group:
-        return jsonify({"error": "Group not found"}), 404
-    
-    members = group.get("members", [])
-    if not any(m["email"] == user["email"] for m in members):
-        members.append({"name": user["name"], "email": user["email"]})
-        logs = group.get("logs", [])
-        logs.insert(0, f"{user['name']} joined the workspace.")
-        gref.update({"members": members, "logs": logs})
-    
-    codes = user.get("joinedGroupCodes", [])
-    if code not in codes:
-        codes.append(code)
-        ref.child("users").child(session["user_id"]).child("joinedGroupCodes").set(codes)
-    
-    return jsonify({"ok": True})
 
-@app.route("/api/groups/joined", methods=["GET"])
-def joined_groups():
-    if "user_id" not in session:
-        return jsonify({"error": "Unauthorized"}), 401
-    user = ref.child("users").child(session["user_id"]).get()
-    codes = user.get("joinedGroupCodes", [])
-    result = []
-    for code in codes:
-        g = ref.child("groups").child(code).get()
-        if g:
-            result.append({"code": code, "name": g.get("name", "Unnamed")})
-    return jsonify(result)
+        db.close()
 
-@app.route("/api/groups/<code>", methods=["GET"])
-def get_group(code):
-    group = ref.child("groups").child(code).get()
-    if not group:
-        return jsonify({"error": "Not found"}), 404
-    return jsonify(dict(group))
+        flash("Group code not found.")
 
-@app.route("/api/groups/<code>/tasks", methods=["POST"])
-def add_task(code):
-    if "user_id" not in session:
-        return jsonify({"error": "Unauthorized"}), 401
-    user = ref.child("users").child(session["user_id"]).get()
-    data = request.json
-    
-    gref = ref.child("groups").child(code)
-    group = gref.get()
-    tasks = group.get("tasks", [])
-    logs = group.get("logs", [])
-    
-    tasks.append({
-        "task": data["task"],
-        "assignee": data["assignee"],
-        "status": data["status"]
-    })
-    logs.insert(0, f"{user['name']} added task: {data['task']}")
-    
-    gref.update({"tasks": tasks, "logs": logs})
-    return jsonify({"ok": True})
+        return redirect(url_for("groups"))
 
-@app.route("/api/groups/<code>/tasks/<int:idx>/status", methods=["PATCH"])
-def update_task_status(code, idx):
-    if "user_id" not in session:
-        return jsonify({"error": "Unauthorized"}), 401
-    user = ref.child("users").child(session["user_id"]).get()
-    new_status = request.json["status"]
-    
-    gref = ref.child("groups").child(code)
-    group = gref.get()
-    tasks = group.get("tasks", [])
-    logs = group.get("logs", [])
-    
-    if 0 <= idx < len(tasks):
-        tasks[idx]["status"] = new_status
-        logs.insert(0, f"{user['name']} changed '{tasks[idx]['task']}' to {new_status}")
-        gref.update({"tasks": tasks, "logs": logs})
-    
-    return jsonify({"ok": True})
+    try:
 
-@app.route("/api/groups/<code>/tasks/<int:idx>", methods=["DELETE"])
-def delete_task(code, idx):
-    if "user_id" not in session:
-        return jsonify({"error": "Unauthorized"}), 401
-    user = ref.child("users").child(session["user_id"]).get()
-    
-    gref = ref.child("groups").child(code)
-    group = gref.get()
-    tasks = group.get("tasks", [])
-    logs = group.get("logs", [])
-    
-    if 0 <= idx < len(tasks):
-        removed = tasks.pop(idx)
-        logs.insert(0, f"{user['name']} deleted task: {removed['task']}")
-        gref.update({"tasks": tasks, "logs": logs})
-    
-    return jsonify({"ok": True})
+        db.execute(
+            """
+            INSERT INTO group_members
+            (group_id, student_id)
+            VALUES (?, ?)
+            """,
+            (
+                group["id"],
+                session["student_id"]
+            )
+        )
 
-@app.route("/api/groups/<code>/leave", methods=["POST"])
-def leave_group(code):
-    if "user_id" not in session:
-        return jsonify({"error": "Unauthorized"}), 401
-    user_ref = ref.child("users").child(session["user_id"])
-    user = user_ref.get()
-    codes = user.get("joinedGroupCodes", [])
-    if code in codes:
-        codes.remove(code)
-        user_ref.child("joinedGroupCodes").set(codes)
-    return jsonify({"ok": True})
+        db.commit()
+
+    except sqlite3.IntegrityError:
+
+        flash("You are already a member of this group.")
+
+    db.close()
+
+    return redirect(
+        url_for(
+            "group_page",
+            group_id=group["id"]
+        )
+    )
+
+
+# =========================
+# GROUP PAGE
+# =========================
+
+@app.route("/groups/<int:group_id>")
+def group_page(group_id):
+
+    if not login_required():
+        return redirect(url_for("login"))
+
+    student_id = session["student_id"]
+
+    db = get_db()
+
+    membership = db.execute(
+        """
+        SELECT *
+        FROM group_members
+        WHERE group_id = ?
+        AND student_id = ?
+        """,
+        (
+            group_id,
+            student_id
+        )
+    ).fetchone()
+
+    if not membership:
+
+        db.close()
+
+        flash("You are not a member of this group.")
+
+        return redirect(url_for("groups"))
+
+    group = db.execute(
+        """
+        SELECT *
+        FROM groups
+        WHERE id = ?
+        """,
+        (group_id,)
+    ).fetchone()
+
+    tasks = db.execute(
+        """
+        SELECT *
+        FROM group_tasks
+        WHERE group_id = ?
+        ORDER BY due_date
+        """,
+        (group_id,)
+    ).fetchall()
+
+    members = db.execute(
+        """
+        SELECT students.*
+        FROM students
+        JOIN group_members
+        ON students.id = group_members.student_id
+        WHERE group_members.group_id = ?
+        """,
+        (group_id,)
+    ).fetchall()
+
+    db.close()
+
+    return render_template(
+        "group.html",
+        group=group,
+        tasks=tasks,
+        members=members
+    )
+
+
+# =========================
+# GROUP TASK
+# =========================
+
+@app.route(
+    "/groups/<int:group_id>/tasks",
+    methods=["POST"]
+)
+def add_group_task(group_id):
+
+    if not login_required():
+        return redirect(url_for("login"))
+
+    db = get_db()
+
+    membership = db.execute(
+        """
+        SELECT *
+        FROM group_members
+        WHERE group_id = ?
+        AND student_id = ?
+        """,
+        (
+            group_id,
+            session["student_id"]
+        )
+    ).fetchone()
+
+    if not membership:
+
+        db.close()
+
+        return "You are not a group member.", 403
+
+    title = request.form["title"]
+    description = request.form["description"]
+    due_date = request.form["due_date"]
+
+    db.execute(
+        """
+        INSERT INTO group_tasks
+        (group_id, title, description, due_date)
+        VALUES (?, ?, ?, ?)
+        """,
+        (
+            group_id,
+            title,
+            description,
+            due_date
+        )
+    )
+
+    db.commit()
+    db.close()
+
+    return redirect(
+        url_for(
+            "group_page",
+            group_id=group_id
+        )
+    )
+
+
+# =========================
+# COMPLETE GROUP TASK
+# =========================
+
+@app.route(
+    "/groups/<int:group_id>/tasks/<int:task_id>/complete"
+)
+def complete_group_task(group_id, task_id):
+
+    if not login_required():
+        return redirect(url_for("login"))
+
+    db = get_db()
+
+    db.execute(
+        """
+        UPDATE group_tasks
+        SET completed = CASE
+            WHEN completed = 0 THEN 1
+            ELSE 0
+        END
+        WHERE id = ?
+        AND group_id = ?
+        """,
+        (
+            task_id,
+            group_id
+        )
+    )
+
+    db.commit()
+    db.close()
+
+    return redirect(
+        url_for(
+            "group_page",
+            group_id=group_id
+        )
+    )
+
+
+# =========================
+# REVIEW PAD
+# =========================
+
+@app.route("/review-pad", methods=["GET", "POST"])
+def review_pad():
+
+    if not login_required():
+        return redirect(url_for("login"))
+
+    student_id = session["student_id"]
+
+    db = get_db()
+
+    if request.method == "POST":
+
+        title = request.form["title"]
+        content = request.form["content"]
+
+        db.execute(
+            """
+            INSERT INTO reviews
+            (student_id, title, content)
+            VALUES (?, ?, ?)
+            """,
+            (
+                student_id,
+                title,
+                content
+            )
+        )
+
+        db.commit()
+
+    reviews = db.execute(
+        """
+        SELECT *
+        FROM reviews
+        WHERE student_id = ?
+        ORDER BY created_at DESC
+        """,
+        (student_id,)
+    ).fetchall()
+
+    db.close()
+
+    return render_template(
+        "review_pad.html",
+        reviews=reviews
+    )
+
+
+@app.route("/review-pad/delete/<int:review_id>")
+def delete_review(review_id):
+
+    if not login_required():
+        return redirect(url_for("login"))
+
+    db = get_db()
+
+    db.execute(
+        """
+        DELETE FROM reviews
+        WHERE id = ?
+        AND student_id = ?
+        """,
+        (
+            review_id,
+            session["student_id"]
+        )
+    )
+
+    db.commit()
+    db.close()
+
+    return redirect(url_for("review_pad"))
+
+
+# =========================
+# START APP
+# =========================
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+
+    init_db()
+
+    port = int(os.environ.get("PORT", 5000))
+
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        debug=False
+    )
