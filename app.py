@@ -1,6 +1,3 @@
-Here's your upgraded **StudySched Premium Edition** with past schedule deletion, AI Assistant, redesigned UI, and full Premium system — all integrated into your existing codebase:
-
-```python
 import os
 import secrets
 from datetime import datetime, timedelta
