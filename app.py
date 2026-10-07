@@ -1,6 +1,7 @@
 import os
 import secrets
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from functools import wraps
 
 from flask import (
@@ -14,7 +15,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 # =========================================================
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "studysched-secret-change-this")
+app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
@@ -39,6 +40,8 @@ if USE_POSTGRES:
         cur = db.cursor(cursor_factory=RealDictCursor)
 
         query = query.replace("?", "%s")
+        # SQLite-style INTEGER PRIMARY KEY does not auto-increment in PostgreSQL.
+        query = query.replace("id INTEGER PRIMARY KEY", "id SERIAL PRIMARY KEY")
 
         if many:
             cur.executemany(query, params)
@@ -167,7 +170,7 @@ def init_db():
     # Create default admin
     admin = execute(
         "SELECT id FROM users WHERE username = ?",
-        ("admin",),
+        (os.environ.get("ADMIN_USERNAME", "admin"),),
         fetch=True
     )
 
@@ -177,8 +180,8 @@ def init_db():
         (username, password, full_name, is_admin)
         VALUES (?, ?, ?, ?)
         """, (
-            "admin",
-            generate_password_hash("admin123"),
+            os.environ.get("ADMIN_USERNAME", "admin"),
+            generate_password_hash(os.environ.get("ADMIN_PASSWORD", "admin123")),
             "StudySched Administrator",
             1
         ))
@@ -564,55 +567,59 @@ StudySched — Student Schedule & Group Project Manager
 
 <script>
 
-if ("Notification" in window) {
+let notificationReady = false;
 
+async function enableNotifications() {
+    if (!("Notification" in window)) return;
     if (Notification.permission === "default") {
-        Notification.requestPermission();
+        const permission = await Notification.requestPermission();
+        notificationReady = permission === "granted";
+    } else {
+        notificationReady = Notification.permission === "granted";
     }
 
+    if ("serviceWorker" in navigator) {
+        try {
+            await navigator.serviceWorker.register("/sw.js");
+        } catch (e) {}
+    }
 }
 
-function notifyUser(title, message) {
+function notifyUser(title, message, key) {
+    if (!notificationReady) return;
+    const storageKey = "studysched_notified_" + key;
+    if (localStorage.getItem(storageKey)) return;
+    localStorage.setItem(storageKey, "1");
 
-    if ("Notification" in window &&
-        Notification.permission === "granted") {
-
-        new Notification(title, {
-            body: message,
-            icon: "/icon.svg"
+    if (navigator.serviceWorker && navigator.serviceWorker.controller) {
+        navigator.serviceWorker.ready.then(reg => {
+            reg.showNotification(title, {
+                body: message,
+                icon: "/icon.svg",
+                tag: key
+            });
         });
-
+    } else {
+        new Notification(title, {body: message, icon: "/icon.svg"});
     }
-
 }
 
 async function checkSchedules() {
-
     try {
-
-        const response =
-            await fetch("/api/upcoming");
-
-        const schedules =
-            await response.json();
-
+        const response = await fetch("/api/upcoming", {credentials: "same-origin"});
+        if (!response.ok) return;
+        const schedules = await response.json();
         schedules.forEach(item => {
-
-            if (!item.notified) {
-
-                notifyUser(
-                    "📚 StudySched Reminder",
-                    item.title + " is starting soon!"
-                );
-
-            }
-
+            notifyUser(
+                "📚 StudySched Reminder",
+                item.title + " is starting soon!",
+                item.id + "_" + item.schedule_date + "_" + item.schedule_time
+            );
         });
-
     } catch(e) {}
-
 }
 
+enableNotifications().then(checkSchedules);
 setInterval(checkSchedules, 30000);
 
 </script>
@@ -1179,7 +1186,7 @@ def upcoming():
     WHERE user_id = ?
     """, (user["id"],), fetch=True)
 
-    now = datetime.now()
+    now = datetime.now(ZoneInfo("Asia/Manila"))
 
     result = []
 
@@ -1191,7 +1198,7 @@ def upcoming():
                 item["schedule_date"] + " " +
                 item["schedule_time"],
                 "%Y-%m-%d %H:%M"
-            )
+            ).replace(tzinfo=ZoneInfo("Asia/Manila"))
 
             seconds = (
                 schedule_dt - now
@@ -1206,8 +1213,10 @@ def upcoming():
             ):
 
                 result.append({
+                    "id": item["id"],
                     "title": item["title"],
-                    "notified": False
+                    "schedule_date": item["schedule_date"],
+                    "schedule_time": item["schedule_time"]
                 })
 
         except:
@@ -1498,6 +1507,15 @@ def group_page(group_id):
             int(assigned_to)
             if assigned_to else None
         )
+
+        if assigned_to is not None:
+            valid_assignee = execute("""
+            SELECT id FROM group_members
+            WHERE group_id = ? AND user_id = ?
+            """, (group_id, assigned_to), fetch=True)
+            if not valid_assignee:
+                flash("That student is not a member of this group.")
+                return redirect(url_for("group_page", group_id=group_id))
 
         execute("""
         INSERT INTO tasks
