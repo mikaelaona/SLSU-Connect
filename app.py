@@ -14,6 +14,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 # =========================================================
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
+app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax", SESSION_COOKIE_SECURE=os.environ.get("RENDER", "").lower() == "true")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 PREMIUM_COST = 0
 AI_ENABLED = True
@@ -205,7 +206,12 @@ def is_premium_active(user):
         return False
     if user["premium_until"]:
         try:
-            expiry = datetime.fromisoformat(str(user["premium_until"])).replace(tzinfo=ZoneInfo("Asia/Manila"))
+            value = user["premium_until"]
+            expiry = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=ZoneInfo("Asia/Manila"))
+            else:
+                expiry = expiry.astimezone(ZoneInfo("Asia/Manila"))
             return expiry > datetime.now(ZoneInfo("Asia/Manila"))
         except Exception:
             return True
@@ -529,7 +535,12 @@ async function checkSchedules() {
         });
     } catch(e) {}
 }
-enableNotifications().then(checkSchedules);
+async function registerServiceWorker() {
+    if ("serviceWorker" in navigator) {
+        try { await navigator.serviceWorker.register("/sw.js"); } catch (e) {}
+    }
+}
+registerServiceWorker().then(() => enableNotifications().then(checkSchedules));
 setInterval(checkSchedules, 30000);
 </script>
 </body>
@@ -978,16 +989,38 @@ def group_page(group_id):
         return "Access denied", 403
     group = execute("SELECT * FROM groups WHERE id = ?", (group_id,), fetch=True)[0]
     if request.method == "POST":
+        action = request.form.get("action", "create_task")
+        if action == "delete_task":
+            try:
+                task_id = int(request.form.get("task_id", "0"))
+            except (TypeError, ValueError):
+                task_id = 0
+            task_result = execute("SELECT * FROM tasks WHERE id = ? AND group_id = ?", (task_id, group_id), fetch=True)
+            if not task_result:
+                flash("Task not found.", "danger")
+            else:
+                execute("DELETE FROM tasks WHERE id = ? AND group_id = ?", (task_id, group_id))
+                add_activity(group_id, user["id"], f"Deleted task: {task_result[0]['title']}")
+                flash("🗑️ Task deleted.", "success")
+            return redirect(url_for("group_page", group_id=group_id))
+
+        title = request.form.get("title", "").strip()
+        if not title:
+            flash("Task title is required.", "danger")
+            return redirect(url_for("group_page", group_id=group_id))
         assigned = request.form.get("assigned_to") or None
         if assigned:
-            assigned = int(assigned)
-            if not execute("SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?", (group_id, assigned), fetch=True):
+            try:
+                assigned = int(assigned)
+            except (TypeError, ValueError):
+                assigned = None
+            if assigned is None or not execute("SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?", (group_id, assigned), fetch=True):
                 flash("Assignee not in group.", "danger")
                 return redirect(url_for("group_page", group_id=group_id))
         execute("""INSERT INTO tasks (group_id, title, description, assigned_to, deadline)
                   VALUES (?, ?, ?, ?, ?)""",
-                (group_id, request.form["title"], request.form.get("description", ""), assigned, request.form.get("deadline", "")))
-        add_activity(group_id, user["id"], f"Created task: {request.form['title']}")
+                (group_id, title, request.form.get("description", "").strip(), assigned, request.form.get("deadline", "")))
+        add_activity(group_id, user["id"], f"Created task: {title}")
         flash("✅ Task added!", "success")
         return redirect(url_for("group_page", group_id=group_id))
     members = execute("SELECT u.* FROM users u JOIN group_members gm ON gm.user_id = u.id WHERE gm.group_id = ?", (group_id,), fetch=True)
@@ -1183,4 +1216,4 @@ def health():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    app.run(host="0.0.0.0", port=port, debug=os.environ.get("FLASK_DEBUG", "0") == "1")
