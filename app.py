@@ -1,1219 +1,208 @@
-import os
-import secrets
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+import os, sqlite3, secrets
+from datetime import datetime
 from functools import wraps
-from flask import (
-    Flask, request, redirect, url_for, session,
-    render_template_string, jsonify, flash
-)
+from flask import Flask, request, redirect, url_for, session, render_template_string, jsonify
 from werkzeug.security import generate_password_hash, check_password_hash
 
-# =========================================================
-# APP CONFIG
-# =========================================================
-app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
-app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax", SESSION_COOKIE_SECURE=os.environ.get("RENDER", "").lower() == "true")
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
-PREMIUM_COST = 0
-AI_ENABLED = True
-
-# =========================================================
-# DATABASE
-# =========================================================
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-USE_POSTGRES = DATABASE_URL.startswith("postgresql://")
-
-if USE_POSTGRES:
+try:
     import psycopg2
     from psycopg2.extras import RealDictCursor
-    def get_db():
-        return psycopg2.connect(DATABASE_URL)
-    def execute(query, params=(), fetch=False, many=False):
-        db = get_db()
-        cur = db.cursor(cursor_factory=RealDictCursor)
-        query = query.replace("?", "%s")
-        query = query.replace("id INTEGER PRIMARY KEY", "id SERIAL PRIMARY KEY")
-        if many:
-            cur.executemany(query, params)
-        else:
-            cur.execute(query, params)
-        result = cur.fetchall() if fetch else None
-        db.commit()
-        cur.close()
-        db.close()
-        return result
-else:
-    import sqlite3
-    DB_FILE = "studysched.db"
-    def get_db():
-        db = sqlite3.connect(DB_FILE)
-        db.row_factory = sqlite3.Row
-        return db
-    def execute(query, params=(), fetch=False, many=False):
-        db = get_db()
-        cur = db.cursor()
-        if many:
-            cur.executemany(query, params)
-        else:
-            cur.execute(query, params)
-        result = cur.fetchall() if fetch else None
-        db.commit()
-        cur.close()
-        db.close()
-        return result
+except Exception:
+    psycopg2 = None
 
-# =========================================================
-# DATABASE INITIALIZATION
-# =========================================================
+app = Flask(__name__)
+app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(32))
+DATABASE_URL = os.environ.get('DATABASE_URL', '')
+ADMIN_USERNAME = os.environ.get('ADMIN_USERNAME', 'admin')
+ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'admin123')
+
+SCHEMA = [
+'''CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, full_name TEXT NOT NULL, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''',
+'''CREATE TABLE IF NOT EXISTS schedules (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL, title TEXT NOT NULL, schedule_date TEXT NOT NULL, schedule_time TEXT NOT NULL, description TEXT DEFAULT '', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''',
+'''CREATE TABLE IF NOT EXISTS groups (id SERIAL PRIMARY KEY, name TEXT NOT NULL, owner_id INTEGER NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''',
+'''CREATE TABLE IF NOT EXISTS group_members (group_id INTEGER NOT NULL, user_id INTEGER NOT NULL, UNIQUE(group_id,user_id))''',
+'''CREATE TABLE IF NOT EXISTS tasks (id SERIAL PRIMARY KEY, group_id INTEGER NOT NULL, title TEXT NOT NULL, description TEXT DEFAULT '', assigned_to INTEGER, status TEXT DEFAULT 'Pending', progress INTEGER DEFAULT 0, proof TEXT DEFAULT '', updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''',
+'''CREATE TABLE IF NOT EXISTS activity (id SERIAL PRIMARY KEY, group_id INTEGER NOT NULL, user_id INTEGER NOT NULL, message TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)'''
+]
+
+# SQLite-compatible schema
+SQLITE_SCHEMA = [s.replace(' SERIAL PRIMARY KEY',' INTEGER PRIMARY KEY AUTOINCREMENT').replace(' TIMESTAMP DEFAULT CURRENT_TIMESTAMP',' TEXT DEFAULT CURRENT_TIMESTAMP') for s in SCHEMA]
+
+def db():
+    if DATABASE_URL and psycopg2:
+        return psycopg2.connect(DATABASE_URL, sslmode='require', cursor_factory=RealDictCursor)
+    c=sqlite3.connect('studysched.db')
+    c.row_factory=sqlite3.Row
+    return c
+
+def execute(sql,args=(),fetch=False,one=False):
+    pg=bool(DATABASE_URL and psycopg2)
+    conn=db(); cur=conn.cursor()
+    try:
+        if pg: sql=sql.replace('?', '%s')
+        cur.execute(sql,args)
+        if fetch:
+            rows=cur.fetchall() if not one else cur.fetchone()
+            return rows
+        conn.commit()
+        return cur.lastrowid if not pg else None
+    finally:
+        cur.close(); conn.close()
+
 def init_db():
-    execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY,
-        username VARCHAR(100) UNIQUE NOT NULL,
-        password TEXT NOT NULL,
-        full_name VARCHAR(150) NOT NULL,
-        is_admin INTEGER DEFAULT 0,
-        is_premium INTEGER DEFAULT 0,
-        premium_until TIMESTAMP,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-    """)
-    execute("""
-    CREATE TABLE IF NOT EXISTS schedules (
-        id INTEGER PRIMARY KEY,
-        user_id INTEGER NOT NULL,
-        title VARCHAR(200) NOT NULL,
-        description TEXT,
-        schedule_date VARCHAR(30) NOT NULL,
-        schedule_time VARCHAR(20) NOT NULL,
-        reminder_minutes INTEGER DEFAULT 10,
-        is_deleted INTEGER DEFAULT 0,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-    """)
-    execute("""
-    CREATE TABLE IF NOT EXISTS groups (
-        id INTEGER PRIMARY KEY,
-        name VARCHAR(200) NOT NULL,
-        description TEXT,
-        join_code VARCHAR(20) UNIQUE NOT NULL,
-        owner_id INTEGER NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-    """)
-    execute("""
-    CREATE TABLE IF NOT EXISTS group_members (
-        id INTEGER PRIMARY KEY,
-        group_id INTEGER NOT NULL,
-        user_id INTEGER NOT NULL,
-        joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(group_id, user_id)
-    )
-    """)
-    execute("""
-    CREATE TABLE IF NOT EXISTS tasks (
-        id INTEGER PRIMARY KEY,
-        group_id INTEGER NOT NULL,
-        title VARCHAR(200) NOT NULL,
-        description TEXT,
-        assigned_to INTEGER,
-        deadline VARCHAR(30),
-        status VARCHAR(30) DEFAULT 'Pending',
-        progress INTEGER DEFAULT 0,
-        proof TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-    """)
-    execute("""
-    CREATE TABLE IF NOT EXISTS activity (
-        id INTEGER PRIMARY KEY,
-        group_id INTEGER NOT NULL,
-        user_id INTEGER NOT NULL,
-        message TEXT NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-    """)
-    execute("""
-    CREATE TABLE IF NOT EXISTS ai_conversations (
-        id INTEGER PRIMARY KEY,
-        user_id INTEGER NOT NULL,
-        role VARCHAR(20) NOT NULL,
-        message TEXT NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-    """)
-    # Create default admin
-    admin_user = execute("SELECT id FROM users WHERE username = ?",
-                   (os.environ.get("ADMIN_USERNAME", "admin"),), fetch=True)
-    if not admin_user:
-        execute("""
-        INSERT INTO users
-        (username, password, full_name, is_admin, is_premium)
-        VALUES (?, ?, ?, ?, 1)
-        """, (
-            os.environ.get("ADMIN_USERNAME", "admin"),
-            generate_password_hash(os.environ.get("ADMIN_PASSWORD", "admin123")),
-            "StudySched Administrator",
-            1
-        ))
+    conn=db(); cur=conn.cursor()
+    try:
+        for sql in (SCHEMA if DATABASE_URL and psycopg2 else SQLITE_SCHEMA):
+            cur.execute(sql)
+        conn.commit()
+        # Create default admin account only in users table for easy admin access if needed.
+    finally:
+        cur.close(); conn.close()
 
 init_db()
 
-# =========================================================
-# HELPERS
-# =========================================================
 def current_user():
-    if "user_id" not in session:
-        return None
-    result = execute("SELECT * FROM users WHERE id = ?", (session["user_id"],), fetch=True)
-    return result[0] if result else None
+    uid=session.get('user_id')
+    if not uid:return None
+    return execute('SELECT * FROM users WHERE id=?',(uid,),True,True)
 
-def login_required(func):
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        if "user_id" not in session:
-            return redirect(url_for("login"))
-        return func(*args, **kwargs)
-    return wrapper
+def login_required(f):
+    @wraps(f)
+    def w(*a,**k):
+        if not current_user(): return redirect(url_for('login'))
+        return f(*a,**k)
+    return w
 
-def admin_required(func):
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        user = current_user()
-        if not user or not user["is_admin"]:
-            return "Unauthorized", 403
-        return func(*args, **kwargs)
-    return wrapper
+def layout(title,body):
+    return render_template_string('''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{{title}} - StudySched</title><style>
+body{margin:0;background:#0b0f19;color:#f5f7fb;font-family:Arial,sans-serif}.nav{background:#111827;padding:16px 5%;display:flex;gap:18px;align-items:center;flex-wrap:wrap}.nav a{color:#fff;text-decoration:none}.brand{font-size:21px;font-weight:bold;margin-right:auto}.wrap{max-width:1050px;margin:30px auto;padding:0 18px}.card{background:#151c2b;border:1px solid #273247;border-radius:14px;padding:20px;margin:14px 0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:15px}input,textarea,select{width:100%;box-sizing:border-box;padding:11px;margin:7px 0;background:#0d1422;border:1px solid #334155;color:white;border-radius:8px}button,.btn{background:#2563eb;color:white;border:0;border-radius:8px;padding:10px 15px;text-decoration:none;display:inline-block;cursor:pointer}.danger{background:#dc2626}.muted{color:#94a3b8}.bar{height:9px;background:#273247;border-radius:10px;overflow:hidden}.fill{height:100%;background:#22c55e}.small{font-size:13px}.err{color:#fca5a5}.ok{color:#86efac}table{width:100%;border-collapse:collapse}td,th{padding:9px;border-bottom:1px solid #293449;text-align:left}</style></head><body><div class="nav"><a class="brand" href="{{url_for('dashboard')}}">StudySched</a><a href="{{url_for('dashboard')}}">Dashboard</a>{% if session.get('user_id') %}<a href="{{url_for('schedule')}}">My Schedule</a><a href="{{url_for('groups')}}">Groups</a><a href="{{url_for('logout')}}">Logout</a>{% else %}<a href="{{url_for('login')}}">Login</a><a href="{{url_for('register')}}">Register</a>{% endif %}</div><div class="wrap">{{body|safe}}</div></body></html>''',title=title,body=body)
 
-def premium_required(func):
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        user = current_user()
-        if not user:
-            return redirect(url_for("login"))
-        if not is_premium_active(user):
-            flash("✨ This feature requires Premium access.", "info")
-            return redirect(url_for("premium"))
-        return func(*args, **kwargs)
-    return wrapper
+@app.route('/')
+def home():
+    return redirect(url_for('dashboard') if current_user() else url_for('login'))
 
-def is_premium_active(user):
-    if not user or not user["is_premium"]:
-        return False
-    if user["premium_until"]:
-        try:
-            value = user["premium_until"]
-            expiry = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
-            if expiry.tzinfo is None:
-                expiry = expiry.replace(tzinfo=ZoneInfo("Asia/Manila"))
-            else:
-                expiry = expiry.astimezone(ZoneInfo("Asia/Manila"))
-            return expiry > datetime.now(ZoneInfo("Asia/Manila"))
-        except Exception:
-            return True
-    return True
-
-def add_activity(group_id, user_id, message):
-    execute("INSERT INTO activity (group_id, user_id, message) VALUES (?, ?, ?)",
-            (group_id, user_id, message))
-
-def ai_response(user_message, user):
-    msg = user_message.lower()
-    responses = {
-        "schedule": "📅 Here's how I can help! Create study schedules under Schedule tab. I suggest 50-min study + 10-min break cycles.",
-        "study": "🧠 Pomodoro technique works best! Study 25-50 mins, short break, repeat. Focus on hard topics first when energy is high.",
-        "exam": "📖 Exam prep plan: 1) Review notes 2) Practice problems 3) Self-quiz 4) Teach concepts. Start at least 1 week before!",
-        "group": "👥 Create groups under Groups tab — invite classmates with your unique join code! Split tasks and track progress together.",
-        "task": "✅ Break big tasks into small steps! Assign deadlines and update progress as you go. Don't forget to attach proof!",
-        "progress": "📊 Keep updating task progress! Small daily steps = big results. Celebrate completed milestones!",
-        "premium": "✨ Premium gives you AI assistant, unlimited schedules, priority reminders, no ads, and custom themes!",
-        "hello": f"Hello {user['full_name']}! 👋 I'm your StudySched AI assistant. Ask me about schedules, study tips, groups, or productivity!",
-        "help": "I can help with: 📅 Scheduling | 🧠 Study plans | 👥 Group work | ✅ Task management | ⚡ Productivity tips"
-    }
-    for kw, reply in responses.items():
-        if kw in msg:
-            return reply
-    return f"I'm here to help! 💬 Ask me about schedules, study plans, group projects, or productivity tips. Type 'help' for options."
-
-# =========================================================
-# PREMIUM THEMED CSS
-# =========================================================
-CSS = """
-:root {
-    --primary: #4f46e5;
-    --primary-light: #818cf8;
-    --primary-dark: #3730a3;
-    --accent: #f59e0b;
-    --accent-light: #fcd34d;
-    --success: #10b981;
-    --danger: #ef4444;
-    --bg: #f8fafc;
-    --bg-gradient: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
-    --card-shadow: 0 10px 40px rgba(79, 70, 229, 0.12);
-    --card-hover-shadow: 0 20px 60px rgba(79, 70, 229, 0.18);
-    --premium-gradient: linear-gradient(135deg, #f59e0b 0%, #facc15 50%, #f59e0b 100%);
-}
-* { margin: 0; padding: 0; box-sizing: border-box; }
-body {
-    font-family: 'Segoe UI', 'Inter', system-ui, sans-serif;
-    background: var(--bg);
-    color: #1e293b;
-    line-height: 1.6;
-}
-nav {
-    background: rgba(255,255,255,0.9);
-    backdrop-filter: blur(12px);
-    box-shadow: 0 2px 20px rgba(0,0,0,0.06);
-    padding: 14px 32px;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    position: sticky;
-    top: 0;
-    z-index: 100;
-}
-.logo {
-    font-size: 22px;
-    font-weight: 800;
-    background: var(--bg-gradient);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    letter-spacing: -0.5px;
-}
-.navlinks { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
-.navlinks a {
-    color: #475569;
-    text-decoration: none;
-    padding: 10px 16px;
-    border-radius: 12px;
-    font-weight: 500;
-    transition: all 0.25s ease;
-}
-.navlinks a:hover { background: #eef2ff; color: var(--primary); transform: translateY(-1px); }
-.navlinks a.premium-link {
-    background: var(--premium-gradient);
-    color: #78350f;
-    font-weight: 700;
-    box-shadow: 0 4px 12px rgba(245, 158, 11, 0.3);
-}
-.container { max-width: 1200px; margin: 0 auto; padding: 32px 24px; }
-.hero {
-    background: var(--bg-gradient);
-    color: white;
-    padding: 48px;
-    border-radius: 24px;
-    margin-bottom: 32px;
-    box-shadow: 0 20px 60px rgba(79, 70, 229, 0.25);
-    position: relative;
-    overflow: hidden;
-}
-.hero::before {
-    content: '';
-    position: absolute;
-    top: -50%; right: -10%;
-    width: 300px; height: 300px;
-    background: rgba(255,255,255,0.1);
-    border-radius: 50%;
-}
-.hero h1 { font-size: 38px; margin-bottom: 12px; position: relative; }
-.hero p { font-size: 18px; opacity: 0.9; max-width: 600px; position: relative; }
-.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 24px; margin-bottom: 32px; }
-.card {
-    background: white;
-    padding: 28px;
-    border-radius: 20px;
-    box-shadow: var(--card-shadow);
-    transition: all 0.3s ease;
-    margin-bottom: 24px;
-}
-.card:hover { transform: translateY(-4px); box-shadow: var(--card-hover-shadow); }
-.stat { font-size: 36px; font-weight: 800; color: var(--primary); line-height: 1; }
-h2 { font-size: 24px; margin-bottom: 20px; color: #1e293b; }
-h3 { font-size: 18px; margin-bottom: 10px; color: #334155; }
-input, textarea, select {
-    width: 100%; padding: 14px 16px; margin: 8px 0 16px;
-    border: 2px solid #e2e8f0; border-radius: 12px;
-    font-size: 15px; transition: border-color 0.2s;
-}
-input:focus, textarea:focus, select:focus {
-    outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(79,70,229,0.1);
-}
-button, .btn {
-    border: none; padding: 13px 22px; border-radius: 12px;
-    font-size: 15px; font-weight: 600; cursor: pointer;
-    text-decoration: none; display: inline-block;
-    transition: all 0.2s ease;
-}
-.btn-primary { background: var(--primary); color: white; }
-.btn-primary:hover { background: var(--primary-dark); transform: translateY(-1px); }
-.btn-green { background: var(--success); color: white; }
-.btn-red { background: var(--danger); color: white; }
-.btn-outline { background: transparent; border: 2px solid var(--primary); color: var(--primary); }
-.btn-outline:hover { background: var(--primary); color: white; }
-.premium-badge {
-    display: inline-block; background: var(--premium-gradient); color: #78350f;
-    padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 700; margin-left: 8px;
-}
-.premium-card {
-    border: 2px solid transparent;
-    background: linear-gradient(white, white) padding-box, var(--premium-gradient) border-box;
-}
-.tabs { display: flex; gap: 8px; margin-bottom: 24px; flex-wrap: wrap; }
-.tabs a {
-    background: white; padding: 12px 20px; border-radius: 12px; text-decoration: none;
-    color: #64748b; font-weight: 500; transition: all 0.2s;
-}
-.tabs a.active { background: var(--primary); color: white; box-shadow: 0 4px 12px rgba(79,70,229,0.25); }
-.schedule-item {
-    border-left: 4px solid var(--primary); padding: 20px; background: white;
-    margin-bottom: 16px; border-radius: 0 16px 16px 0; box-shadow: 0 2px 12px rgba(0,0,0,0.04);
-    transition: all 0.2s;
-}
-.schedule-item:hover { box-shadow: 0 4px 20px rgba(0,0,0,0.08); }
-.schedule-past { opacity: 0.65; border-left-color: #94a3b8; }
-.task {
-    border: 2px solid #f1f5f9; padding: 20px; margin-bottom: 16px; border-radius: 16px;
-    background: white; transition: all 0.2s;
-}
-.task:hover { border-color: var(--primary-light); }
-.progress { background: #e2e8f0; border-radius: 20px; height: 10px; overflow: hidden; margin: 12px 0; }
-.progress-bar { background: var(--success); height: 100%; border-radius: 20px; transition: width 0.4s ease; }
-.badge {
-    padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: 600; display: inline-block;
-}
-.badge-pending { background: #fef3c7; color: #92400e; }
-.badge-progress { background: #dbeafe; color: #1e40af; }
-.badge-done { background: #d1fae7; color: #065f46; }
-.alert { padding: 14px 18px; border-radius: 12px; margin-bottom: 20px; font-weight: 500; }
-.alert-info { background: #eef2ff; color: #3730a3; }
-.alert-success { background: #dcfce7; color: #166534; }
-.alert-danger { background: #fee2e2; color: #991b1b; }
-.login-box { max-width: 440px; margin: 80px auto; }
-footer { text-align: center; color: #94a3b8; padding: 40px; font-size: 14px; }
-.small { color: #94a3b8; font-size: 13px; }
-.ai-chat {
-    position: fixed; bottom: 24px; right: 24px; width: 380px; max-height: 550px;
-    background: white; border-radius: 20px; box-shadow: 0 10px 50px rgba(79,70,229,0.25);
-    display: flex; flex-direction: column; overflow: hidden; z-index: 999;
-}
-.ai-header {
-    background: var(--bg-gradient); color: white; padding: 16px 20px;
-    display: flex; justify-content: space-between; align-items: center; font-weight: 700;
-}
-.ai-body { padding: 16px; overflow-y: auto; flex: 1; max-height: 400px; }
-.ai-bubble {
-    padding: 12px 16px; border-radius: 18px; margin-bottom: 12px; max-width: 85%; line-height: 1.5;
-}
-.ai-bot { background: #eef2ff; color: #3730a3; border-bottom-left-radius: 4px; }
-.ai-user { background: var(--primary); color: white; margin-left: auto; border-bottom-right-radius: 4px; }
-.ai-input { display: flex; border-top: 1px solid #e2e8f0; padding: 12px; gap: 8px; }
-.ai-input input { margin: 0; flex: 1; }
-.ai-toggle {
-    position: fixed; bottom: 24px; right: 24px; width: 60px; height: 60px;
-    border-radius: 50%; background: var(--bg-gradient); color: white;
-    font-size: 26px; display: flex; align-items: center; justify-content: center;
-    box-shadow: 0 4px 20px rgba(79,70,229,0.3); cursor: pointer; z-index: 998;
-}
-.hidden { display: none !important; }
-@media(max-width:768px) {
-    nav { flex-direction: column; gap: 12px; padding: 16px; }
-    .container { padding: 20px 16px; }
-    .hero { padding: 32px 24px; }
-    .hero h1 { font-size: 28px; }
-    .ai-chat { width: calc(100% - 32px); right: 16px; bottom: 16px; }
-}
-"""
-
-# =========================================================
-# BASE TEMPLATE
-# =========================================================
-BASE = """
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>{% block title %}{{ title }} - StudySched{% endblock %}</title>
-<style>{{ css }}</style>
-</head>
-<body>
-<nav>
-    <div class="logo">📚 StudySched</div>
-    <div class="navlinks">
-        {% if user %}
-        <a href="{{ url_for('dashboard') }}">Dashboard</a>
-        <a href="{{ url_for('schedule') }}">Schedule</a>
-        <a href="{{ url_for('groups') }}">Groups</a>
-        <a href="{{ url_for('premium') }}" class="premium-link">✨ Premium</a>
-        {% if user['is_admin'] %}
-        <a href="{{ url_for('admin') }}">Admin</a>
-        {% endif %}
-        <a href="{{ url_for('logout') }}">Logout</a>
-        {% else %}
-        <a href="{{ url_for('login') }}">Login</a>
-        <a href="{{ url_for('register') }}">Register</a>
-        {% endif %}
-    </div>
-</nav>
-<div class="container">
-{% with messages = get_flashed_messages(with_categories=true) %}
-{% for category, message in messages %}
-<div class="alert alert-{{ category or 'info' }}">{{ message }}</div>
-{% endfor %}
-{% endwith %}
-{{ content|safe }}
-</div>
-{% if user and is_premium_active(user) %}
-<button class="ai-toggle" id="aiToggle">🤖</button>
-<div class="ai-chat hidden" id="aiChatBox">
-    <div class="ai-header">
-        <span>🤖 AI Study Assistant</span>
-        <button onclick="toggleChat()" style="background:none;border:none;color:white;font-size:20px;cursor:pointer;">×</button>
-    </div>
-    <div class="ai-body" id="aiBody">
-        <div class="ai-bubble ai-bot">Hi! I'm your AI Study Assistant ✨<br>Ask me anything about studying, schedules, or productivity!</div>
-    </div>
-    <form class="ai-input" onsubmit="sendAiMsg(event)">
-        <input id="aiInput" placeholder="Type your question..." required>
-        <button type="submit" class="btn-primary">Send</button>
-    </form>
-</div>
-{% endif %}
-<footer>StudySched © 2026 — Smart Study, Better Results ✨</footer>
-<script>
-const premiumActive = {{ 'true' if (user and is_premium_active(user)) else 'false' }};
-function toggleChat() {
-    const chat = document.getElementById('aiChatBox');
-    const toggle = document.getElementById('aiToggle');
-    if (chat) { chat.classList.toggle('hidden'); if(toggle) toggle.classList.toggle('hidden'); }
-}
-async function sendAiMsg(e) {
-    e.preventDefault();
-    const input = document.getElementById('aiInput');
-    const body = document.getElementById('aiBody');
-    const msg = input.value.trim();
-    if (!msg) return;
-    body.innerHTML += `<div class="ai-bubble ai-user">${msg}</div>`;
-    input.value = '';
-    const res = await fetch('/api/ai-chat', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({message: msg})
-    });
-    const data = await res.json();
-    body.innerHTML += `<div class="ai-bubble ai-bot">${data.reply}</div>`;
-    body.scrollTop = body.scrollHeight;
-}
-let notificationReady = false;
-async function enableNotifications() {
-    if (!("Notification" in window)) return;
-    if (Notification.permission === "default") {
-        notificationReady = (await Notification.requestPermission()) === "granted";
-    } else {
-        notificationReady = Notification.permission === "granted";
-    }
-}
-function notifyUser(title, message, key) {
-    if (!notificationReady) return;
-    const storageKey = "studysched_notified_" + key;
-    if (localStorage.getItem(storageKey)) return;
-    localStorage.setItem(storageKey, "1");
-    if (navigator.serviceWorker?.ready) {
-        navigator.serviceWorker.ready.then(r => r.showNotification(title, {body: message, tag: key}));
-    } else { new Notification(title, {body: message}); }
-}
-async function checkSchedules() {
-    try {
-        const res = await fetch("/api/upcoming", {credentials: "same-origin"});
-        if (!res.ok) return;
-        (await res.json()).forEach(item => {
-            notifyUser("📚 StudySched Reminder", item.title + " is starting soon!", item.id + "_" + item.schedule_date);
-        });
-    } catch(e) {}
-}
-async function registerServiceWorker() {
-    if ("serviceWorker" in navigator) {
-        try { await navigator.serviceWorker.register("/sw.js"); } catch (e) {}
-    }
-}
-registerServiceWorker().then(() => enableNotifications().then(checkSchedules));
-setInterval(checkSchedules, 30000);
-</script>
-</body>
-</html>
-"""
-
-def render_page(title, content, **context):
-    context.setdefault("user", current_user())
-    context.setdefault("is_premium_active", is_premium_active)
-    return render_template_string(BASE, title=title, content=content, css=CSS, **context)
-
-# =========================================================
-# LANDING
-# =========================================================
-@app.route("/")
-def index():
-    if current_user():
-        return redirect(url_for("dashboard"))
-    content = """
-<div class="hero">
-    <h1>📚 StudySched</h1>
-    <p>Your all-in-one smart planner — organize schedules, manage groups, and study with your personal AI assistant.</p>
-    <div style="margin-top: 28px; display: flex; gap: 12px; flex-wrap: wrap;">
-        <a class="btn-primary btn" href="/register">🚀 Get Started Free</a>
-        <a class="btn-outline btn" href="/login">Login</a>
-    </div>
-</div>
-<div class="cards">
-    <div class="card">
-        <div class="stat">📅</div>
-        <h3>Smart Scheduling</h3>
-        <p>Track classes, study sessions, and deadlines with smart reminders.</p>
-    </div>
-    <div class="card">
-        <div class="stat">👥</div>
-        <h3>Group Projects</h3>
-        <p>Collaborate, assign tasks, and watch progress in real-time.</p>
-    </div>
-    <div class="card">
-        <div class="stat">🤖</div>
-        <h3>AI Assistant <span class="premium-badge">PREMIUM</span></h3>
-        <p>Personal study coach that creates plans and gives tips anytime.</p>
-    </div>
-    <div class="card">
-        <div class="stat">✨</div>
-        <h3>Premium Perks</h3>
-        <p>Unlimited schedules, priority alerts, custom themes, and more.</p>
-    </div>
-</div>
-"""
-    return render_page("Home", content)
-
-# =========================================================
-# PREMIUM PAGE
-# =========================================================
-@app.route("/premium")
-@login_required
-def premium():
-    user = current_user()
-    active = is_premium_active(user)
-    content = f"""
-<div class="hero" style="background: linear-gradient(135deg, #f59e0b, #d97706);">
-    <h1>✨ Upgrade to Premium</h1>
-    <p>Unlock your full potential with AI assistance and advanced features.</p>
-</div>
-"""
-    if active:
-        content += f"""
-<div class="card premium-card">
-    <h2>🎉 You are Premium!</h2>
-    <p>Enjoy all features including AI Assistant, unlimited schedules, priority support, and more.</p>
-    <p>Premium status: Active ✅</p>
-</div>
-<div class="cards">
-    <div class="card"><h3>🤖 AI Assistant</h3><p>24/7 study coach & planner</p></div>
-    <div class="card"><h3>♾️ Unlimited Schedules</h3><p>No limits — add everything</p></div>
-    <div class="card"><h3>🔔 Priority Reminders</h3><p>Earlier alerts & smart notifications</p></div>
-    <div class="card"><h3>🎨 Custom Themes</h3><p>Personalize your dashboard</p></div>
-</div>
-"""
-    else:
-        content += """
-<div class="cards">
-    <div class="card premium-card" style="grid-column: span 2;">
-        <h2>Premium Features</h2>
-        <ul style="margin: 20px 0; padding-left: 20px;">
-            <li style="margin: 10px 0;">🤖 <strong>AI Study Assistant</strong> — personalized plans & tips</li>
-            <li style="margin: 10px 0;">♾️ <strong>Unlimited Schedules</strong> — no limits on events</li>
-            <li style="margin: 10px 0;">🔔 <strong>Priority Reminders</strong> — smart timing & earlier alerts</li>
-            <li style="margin: 10px 0;">📊 <strong>Advanced Analytics</strong> — track study habits</li>
-            <li style="margin: 10px 0;">🎨 <strong>Premium UI Theme</strong> — elegant custom design</li>
-            <li style="margin: 10px 0;">🚀 <strong>Early Access</strong> to new features</li>
-        </ul>
-        <form method="POST">
-            <button type="submit" class="btn" style="background: linear-gradient(135deg, #f59e0b, #d97706); color: white; font-size: 18px; padding: 14px 32px;">✨ Activate Premium (Demo)</button>
-        </form>
-        <p class="small" style="margin-top: 12px;">This is a demo — click to activate instantly.</p>
-    </div>
-</div>
-"""
-    return render_page("Premium", content)
-
-@app.route("/premium", methods=["POST"])
-@login_required
-def premium_activate():
-    user = current_user()
-    execute("UPDATE users SET is_premium = 1, premium_until = ? WHERE id = ?",
-            (datetime.now(ZoneInfo("Asia/Manila")) + timedelta(days=365), user["id"]))
-    flash("✨ Premium activated! Enjoy your AI assistant & all features.", "success")
-    return redirect(url_for("premium"))
-
-# =========================================================
-# AI CHAT API
-# =========================================================
-@app.route("/api/ai-chat", methods=["POST"])
-@premium_required
-def ai_chat():
-    data = request.get_json(force=True)
-    msg = (data.get("message", "") or "").strip()
-    if not msg:
-        return jsonify({"reply": "Please ask me something!"})
-    user = current_user()
-    reply = ai_response(msg, user)
-    execute("INSERT INTO ai_conversations (user_id, role, message) VALUES (?, ?, ?)",
-            (user["id"], "user", msg))
-    execute("INSERT INTO ai_conversations (user_id, role, message) VALUES (?, ?, ?)",
-            (user["id"], "assistant", reply))
-    return jsonify({"reply": reply})
-
-# =========================================================
-# REGISTER
-# =========================================================
-@app.route("/register", methods=["GET", "POST"])
+@app.route('/register',methods=['GET','POST'])
 def register():
-    if request.method == "POST":
-        username = request.form["username"].strip()
-        full_name = request.form["full_name"].strip()
-        password = request.form["password"]
-        if not username or not full_name or not password:
-            flash("Please complete all fields.", "info")
-            return redirect(url_for("register"))
-        if execute("SELECT id FROM users WHERE username = ?", (username,), fetch=True):
-            flash("Username already exists.", "danger")
-            return redirect(url_for("register"))
-        execute("INSERT INTO users (username, password, full_name) VALUES (?, ?, ?)",
-                (username, generate_password_hash(password), full_name))
-        flash("Account created! Welcome to StudySched 🎉", "success")
-        return redirect(url_for("login"))
-    return render_page("Register", """
-<div class="login-box">
-<div class="card">
-<h2>📚 Create Your Account</h2>
-<form method="POST">
-<label>Full Name</label>
-<input name="full_name" required>
-<label>Username</label>
-<input name="username" required>
-<label>Password</label>
-<input type="password" name="password" required>
-<button class="btn-primary" type="submit">Create Account</button>
-</form>
-<p style="margin-top: 16px;">Already have an account? <a href="/login">Login →</a></p>
-</div>
-</div>
-""")
+    msg=''
+    if request.method=='POST':
+        name=request.form.get('full_name','').strip(); username=request.form.get('username','').strip(); password=request.form.get('password','')
+        if not name or not username or not password: msg='Please complete all fields.'
+        elif execute('SELECT id FROM users WHERE username=?',(username,),True,True): msg='Username already exists.'
+        else:
+            execute('INSERT INTO users (full_name,username,password_hash) VALUES (?,?,?)',(name,username,generate_password_hash(password)))
+            return redirect(url_for('login'))
+    return layout('Register',f'''<div class="card"><h1>Create Account</h1><p class="err">{msg}</p><form method="post"><input name="full_name" placeholder="Full name" required><input name="username" placeholder="Username" required><input type="password" name="password" placeholder="Password" required><button>Register</button></form><p>Already have an account? <a href="/login">Login</a></p></div>''')
 
-# =========================================================
-# LOGIN
-# =========================================================
-@app.route("/login", methods=["GET", "POST"])
+@app.route('/login',methods=['GET','POST'])
 def login():
-    if request.method == "POST":
-        users = execute("SELECT * FROM users WHERE username = ?", (request.form["username"],), fetch=True)
-        if not users or not check_password_hash(users[0]["password"], request.form["password"]):
-            flash("Invalid username or password.", "danger")
-            return redirect(url_for("login"))
-        session["user_id"] = users[0]["id"]
-        return redirect(url_for("dashboard"))
-    return render_page("Login", """
-<div class="login-box">
-<div class="card">
-<h2>🔐 Welcome Back</h2>
-<form method="POST">
-<label>Username</label>
-<input name="username" required>
-<label>Password</label>
-<input type="password" name="password" required>
-<button class="btn-primary" type="submit">Login</button>
-</form>
-<p style="margin-top: 16px;">New here? <a href="/register">Create account →</a></p>
-</div>
-</div>
-""")
+    msg=''
+    if request.method=='POST':
+        u=execute('SELECT * FROM users WHERE username=?',(request.form.get('username','').strip(),),True,True)
+        if u and check_password_hash(u['password_hash'],request.form.get('password','')):
+            session['user_id']=u['id']; return redirect(url_for('dashboard'))
+        msg='Invalid username or password.'
+    return layout('Login',f'''<div class="card"><h1>StudySched Login</h1><p class="err">{msg}</p><form method="post"><input name="username" placeholder="Username" required><input type="password" name="password" placeholder="Password" required><button>Login</button></form><p>No account? <a href="/register">Register</a></p><p class="small muted">Admin panel: use /admin with ADMIN_USERNAME and ADMIN_PASSWORD.</p></div>''')
 
-# =========================================================
-# LOGOUT
-# =========================================================
-@app.route("/logout")
-def logout():
-    session.clear()
-    return redirect(url_for("index"))
+@app.route('/logout')
+def logout(): session.clear(); return redirect(url_for('login'))
 
-# =========================================================
-# DASHBOARD
-# =========================================================
-@app.route("/dashboard")
+@app.route('/dashboard')
 @login_required
 def dashboard():
-    user = current_user()
-    schedules = execute("SELECT * FROM schedules WHERE user_id = ? AND is_deleted = 0 ORDER BY schedule_date, schedule_time",
-                       (user["id"],), fetch=True)
-    groups = execute("SELECT g.* FROM groups g JOIN group_members gm ON gm.group_id = g.id WHERE gm.user_id = ?",
-                     (user["id"],), fetch=True)
-    tasks = execute("SELECT t.* FROM tasks t JOIN group_members gm ON gm.group_id = t.group_id WHERE gm.user_id = ? AND t.status != 'Completed'",
-                    (user["id"],), fetch=True)
-    premium = is_premium_active(user)
-    schedule_html = ""
-    for s in schedules[:5]:
-        schedule_html += f'''
-        <div class="schedule-item">
-            <strong>{s['title']}</strong>
-            <p>{s['schedule_date']} at {s['schedule_time']}</p>
-            {f'<p>{s["description"]}</p>' if s['description'] else ''}
-            <span class="badge badge-pending">Reminder {s['reminder_minutes']} min before</span>
-        </div>
-        '''
-    if not schedules:
-        schedule_html = '<p>No schedules yet.</p><a class="btn-primary btn" href="/schedule">+ Add Schedule</a>'
-    groups_html = ""
-    for g in groups:
-        groups_html += f'<p><strong>{g["name"]}</strong><br><span class="small">Code: {g["join_code"]}</span></p>'
-    if not groups:
-        groups_html = '<p>Not in any group yet.</p><a class="btn-outline btn" href="/groups">Browse Groups</a>'
-    content = f"""
-<div class="hero">
-    <h1>Welcome, {user['full_name']}! 👋 {'<span class=\"premium-badge\">PREMIUM</span>' if premium else ''}</h1>
-    <p>Stay organized, track your progress, and achieve your study goals.</p>
-</div>
-<div class="cards">
-    <div class="card"><div class="stat">{len(schedules)}</div><p>Schedules</p></div>
-    <div class="card"><div class="stat">{len(groups)}</div><p>Groups</p></div>
-    <div class="card"><div class="stat">{len(tasks)}</div><p>Active Tasks</p></div>
-</div>
-<div class="card">
-    <h2>📅 Upcoming Schedule</h2>
-    {schedule_html}
-</div>
-<div class="card">
-    <h2>👥 My Groups</h2>
-    {groups_html}
-</div>
-"""
-    return render_page("Dashboard", content)
+    u=current_user(); schedules=execute('SELECT * FROM schedules WHERE user_id=? ORDER BY schedule_date,schedule_time',(u['id'],),True)
+    gs=execute('SELECT g.* FROM groups g JOIN group_members m ON g.id=m.group_id WHERE m.user_id=? ORDER BY g.id DESC',(u['id'],),True)
+    return layout('Dashboard',f'''<h1>Welcome, {u['full_name']}</h1><div class="grid"><div class="card"><h2>{len(schedules)}</h2><p class="muted">Scheduled activities</p><a class="btn" href="/schedule">Manage Schedule</a></div><div class="card"><h2>{len(gs)}</h2><p class="muted">Groups</p><a class="btn" href="/groups">Open Groups</a></div></div><div class="card"><h2>Upcoming</h2>{''.join(f"<p><b>{s['title']}</b> — {s['schedule_date']} {s['schedule_time']}</p>" for s in schedules[:5]) or '<p class="muted">No schedules yet.</p>'}</div>''')
 
-# =========================================================
-# SCHEDULE — with Delete & Past Filter
-# =========================================================
-def render_schedule_item(sched, is_past):
-    return f'''
-<div class="schedule-item {'schedule-past' if is_past else ''}">
-    <h3>{sched['title']}</h3>
-    <p><strong>{sched['schedule_date']} — {sched['schedule_time']}</strong></p>
-    {f'<p>{sched["description"]}</p>' if sched['description'] else ''}
-    <span class="badge {'badge-pending' if not is_past else 'badge-done'}">Reminder: {sched['reminder_minutes']} min before</span>
-    <form method="POST" action="/schedule/{sched['id']}/delete" style="display:inline; margin-left:8px;" onsubmit="return confirm('Delete this schedule?');">
-        <button type="submit" class="btn-red" style="padding:6px 12px; font-size:13px;">🗑️ Delete</button>
-    </form>
-</div>
-'''
-
-@app.route("/schedule", methods=["GET", "POST"])
+@app.route('/schedule',methods=['GET','POST'])
 @login_required
 def schedule():
-    user = current_user()
-    now = datetime.now(ZoneInfo("Asia/Manila"))
-    if request.method == "POST":
-        title = request.form["title"]
-        desc = request.form.get("description", "")
-        date = request.form["date"]
-        time_str = request.form["time"]
-        reminder = int(request.form.get("reminder_minutes", 10))
-        execute("""INSERT INTO schedules (user_id, title, description, schedule_date, schedule_time, reminder_minutes)
-                  VALUES (?, ?, ?, ?, ?, ?)""",
-                (user["id"], title, desc, date, time_str, reminder))
-        flash("✅ Schedule added!", "success")
-        return redirect(url_for("schedule"))
-    schedules = execute("SELECT * FROM schedules WHERE user_id = ? AND is_deleted = 0 ORDER BY schedule_date DESC, schedule_time DESC",
-                       (user["id"],), fetch=True)
-    upcoming, past = [], []
-    for s in schedules:
-        try:
-            dt = datetime.strptime(f"{s['schedule_date']} {s['schedule_time']}", "%Y-%m-%d %H:%M").replace(tzinfo=ZoneInfo("Asia/Manila"))
-            (upcoming if dt >= now else past).append(s)
-        except Exception:
-            upcoming.append(s)
-    upcoming_html = "".join(render_schedule_item(s, False) for s in upcoming) if upcoming else '<p>No upcoming events.</p>'
-    past_html = "".join(render_schedule_item(s, True) for s in past) if past else '<p>No past events.</p>'
-    content = f"""
-<div class="tabs">
-    <a href="/schedule" class="active">📅 My Schedule</a>
-    <a href="/groups">👥 Groups</a>
-</div>
-<div class="card">
-    <h2>➕ Add Schedule</h2>
-    <form method="POST">
-        <label>Title / Subject</label>
-        <input name="title" placeholder="e.g. Math Review" required>
-        <label>Description</label>
-        <textarea name="description" placeholder="Topics to cover..."></textarea>
-        <label>Date</label>
-        <input type="date" name="date" required>
-        <label>Time</label>
-        <input type="time" name="time" required>
-        <label>Reminder</label>
-        <select name="reminder_minutes">
-            <option value="0">At time</option>
-            <option value="5">5 min before</option>
-            <option value="10" selected>10 min before</option>
-            <option value="30">30 min before</option>
-            <option value="60">1 hour before</option>
-        </select>
-        <button class="btn-primary">Add Schedule</button>
-    </form>
-</div>
-<div class="card">
-    <h2>🔜 Upcoming ({len(upcoming)})</h2>
-    {upcoming_html}
-</div>
-<div class="card">
-    <h2>⏳ Past Schedules ({len(past)})</h2>
-    {past_html}
-</div>
-"""
-    return render_page("Schedule", content)
+    u=current_user()
+    if request.method=='POST':
+        execute('INSERT INTO schedules (user_id,title,schedule_date,schedule_time,description) VALUES (?,?,?,?,?)',(u['id'],request.form['title'],request.form['schedule_date'],request.form['schedule_time'],request.form.get('description','')))
+        return redirect(url_for('schedule'))
+    rows=execute('SELECT * FROM schedules WHERE user_id=? ORDER BY schedule_date,schedule_time',(u['id'],),True)
+    html='''<div class="card"><h1>My Schedule</h1><form method="post"><input name="title" placeholder="Activity title" required><input type="date" name="schedule_date" required><input type="time" name="schedule_time" required><textarea name="description" placeholder="Description"></textarea><button>Add Schedule</button></form></div><div class="card"><h2>Activities</h2>'''
+    for s in rows: html+=f'''<div class="card"><b>{s['title']}</b><p>{s['schedule_date']} at {s['schedule_time']}</p><p class="muted">{s['description'] or ''}</p><form method="post" action="/schedule/delete/{s['id']}"><button class="danger">Delete</button></form></div>'''
+    html+='</div>'; return layout('My Schedule',html)
 
-@app.route("/schedule/<int:sched_id>/delete", methods=["POST"])
+@app.route('/schedule/delete/<int:sid>',methods=['POST'])
 @login_required
-def delete_schedule(sched_id):
-    user = current_user()
-    item = execute("SELECT * FROM schedules WHERE id = ? AND user_id = ?", (sched_id, user["id"]), fetch=True)
-    if not item:
-        flash("Schedule not found.", "danger")
-        return redirect(url_for("schedule"))
-    execute("UPDATE schedules SET is_deleted = 1 WHERE id = ?", (sched_id,))
-    flash("🗑️ Schedule deleted.", "success")
-    return redirect(url_for("schedule"))
+def delete_schedule(sid):
+    execute('DELETE FROM schedules WHERE id=? AND user_id=?',(sid,current_user()['id'])); return redirect(url_for('schedule'))
 
-# =========================================================
-# UPCOMING API
-# =========================================================
-@app.route("/api/upcoming")
-@login_required
-def upcoming():
-    user = current_user()
-    schedules = execute("SELECT * FROM schedules WHERE user_id = ? AND is_deleted = 0", (user["id"],), fetch=True)
-    now = datetime.now(ZoneInfo("Asia/Manila"))
-    result = []
-    for s in schedules:
-        try:
-            sched_dt = datetime.strptime(f"{s['schedule_date']} {s['schedule_time']}", "%Y-%m-%d %H:%M").replace(tzinfo=ZoneInfo("Asia/Manila"))
-            sec = (sched_dt - now).total_seconds()
-            if 0 <= sec <= s["reminder_minutes"] * 60:
-                result.append({"id": s["id"], "title": s["title"], "schedule_date": s["schedule_date"], "schedule_time": s["schedule_time"]})
-        except Exception:
-            pass
-    return jsonify(result)
-
-# =========================================================
-# GROUPS & GROUP PAGE
-# =========================================================
-@app.route("/groups", methods=["GET", "POST"])
+@app.route('/groups',methods=['GET','POST'])
 @login_required
 def groups():
-    user = current_user()
-    if request.method == "POST":
-        if request.form.get("action") == "create":
-            code = secrets.token_hex(4).upper()
-            execute("INSERT INTO groups (name, description, join_code, owner_id) VALUES (?, ?, ?, ?)",
-                    (request.form["name"], request.form.get("description", ""), code, user["id"]))
-            group_id = execute("SELECT id FROM groups WHERE join_code = ?", (code,), fetch=True)[0]["id"]
-            execute("INSERT INTO group_members (group_id, user_id) VALUES (?, ?)", (group_id, user["id"]))
-            add_activity(group_id, user["id"], "Created the group")
-            flash(f"✅ Group created! Code: {code}", "success")
-        elif request.form.get("action") == "join":
-            code = request.form["join_code"].strip().upper()
-            found = execute("SELECT * FROM groups WHERE join_code = ?", (code,), fetch=True)
-            if not found:
-                flash("Group code not found.", "danger")
-            else:
-                gid = found[0]["id"]
-                if execute("SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?", (gid, user["id"]), fetch=True):
-                    flash("Already in this group!", "info")
-                else:
-                    execute("INSERT INTO group_members (group_id, user_id) VALUES (?, ?)", (gid, user["id"]))
-                    add_activity(gid, user["id"], "Joined the group")
-                    flash("✅ Joined group!", "success")
-        return redirect(url_for("groups"))
-    groups_list = execute("SELECT g.* FROM groups g JOIN group_members gm ON gm.group_id = g.id WHERE gm.user_id = ?", (user["id"],), fetch=True)
-    groups_html = ""
-    for g in groups_list:
-        groups_html += f'''
-        <div class="task">
-            <h3>{g['name']}</h3>
-            <p>{g['description'] or ''}</p>
-            <p class="small">Code: {g['join_code']}</p>
-            <a class="btn-primary btn" href="/group/{g['id']}">Open →</a>
-        </div>
-        '''
-    if not groups_list:
-        groups_html = '<p>Not in any group yet.</p>'
-    content = f"""
-<div class="cards">
-<div class="card">
-    <h2>➕ Create Group</h2>
-    <form method="POST">
-        <input type="hidden" name="action" value="create">
-        <label>Group Name</label>
-        <input name="name" required>
-        <label>Description</label>
-        <textarea name="description"></textarea>
-        <button class="btn-primary">Create</button>
-    </form>
-</div>
-<div class="card">
-    <h2>🔑 Join Group</h2>
-    <form method="POST">
-        <input type="hidden" name="action" value="join">
-        <label>Enter Code</label>
-        <input name="join_code" placeholder="e.g. A1B2C3D4" required>
-        <button class="btn-outline">Join</button>
-    </form>
-</div>
-</div>
-<div class="card">
-    <h2>My Groups</h2>
-    {groups_html}
-</div>
-"""
-    return render_page("Groups", content)
+    u=current_user()
+    if request.method=='POST':
+        name=request.form.get('name','').strip()
+        if name:
+            gid=execute('INSERT INTO groups (name,owner_id) VALUES (?,?)',(name,u['id']))
+            # SQLite lastrowid; PostgreSQL fallback
+            if not gid:
+                g=execute('SELECT id FROM groups WHERE owner_id=? ORDER BY id DESC',(u['id'],),True,True); gid=g['id']
+            execute('INSERT INTO group_members (group_id,user_id) VALUES (?,?)',(gid,u['id']))
+        return redirect(url_for('groups'))
+    gs=execute('SELECT g.*, (SELECT COUNT(*) FROM group_members m WHERE m.group_id=g.id) members FROM groups g JOIN group_members gm ON g.id=gm.group_id WHERE gm.user_id=?',(u['id'],),True)
+    html='<div class="card"><h1>Groups</h1><form method="post"><input name="name" placeholder="Group name" required><button>Create Group</button></form></div><div class="grid">'
+    for g in gs: html+=f'<div class="card"><h2>{g["name"]}</h2><p>{g["members"]} member(s)</p><a class="btn" href="/group/{g["id"]}">Open Group</a></div>'
+    html+='</div>'; return layout('Groups',html)
 
-@app.route("/group/<int:group_id>", methods=["GET", "POST"])
+@app.route('/group/<int:gid>',methods=['GET','POST'])
 @login_required
-def group_page(group_id):
-    user = current_user()
-    if not execute("SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?", (group_id, user["id"]), fetch=True):
-        return "Access denied", 403
-    group = execute("SELECT * FROM groups WHERE id = ?", (group_id,), fetch=True)[0]
-    if request.method == "POST":
-        action = request.form.get("action", "create_task")
-        if action == "delete_task":
-            try:
-                task_id = int(request.form.get("task_id", "0"))
-            except (TypeError, ValueError):
-                task_id = 0
-            task_result = execute("SELECT * FROM tasks WHERE id = ? AND group_id = ?", (task_id, group_id), fetch=True)
-            if not task_result:
-                flash("Task not found.", "danger")
-            else:
-                execute("DELETE FROM tasks WHERE id = ? AND group_id = ?", (task_id, group_id))
-                add_activity(group_id, user["id"], f"Deleted task: {task_result[0]['title']}")
-                flash("🗑️ Task deleted.", "success")
-            return redirect(url_for("group_page", group_id=group_id))
+def group_page(gid):
+    u=current_user(); member=execute('SELECT * FROM group_members WHERE group_id=? AND user_id=?',(gid,u['id']),True,True)
+    if not member:return 'Access denied',403
+    g=execute('SELECT * FROM groups WHERE id=?',(gid,),True,True)
+    if request.method=='POST':
+        title=request.form.get('title','').strip(); desc=request.form.get('description','').strip(); assigned=request.form.get('assigned_to') or None
+        execute('INSERT INTO tasks (group_id,title,description,assigned_to) VALUES (?,?,?,?)',(gid,title,desc,assigned))
+        execute('INSERT INTO activity (group_id,user_id,message) VALUES (?,?,?)',(gid,u['id'],f'Created task: {title}'))
+        return redirect(url_for('group_page',gid=gid))
+    members=execute('SELECT u.* FROM users u JOIN group_members m ON u.id=m.user_id WHERE m.group_id=?',(gid,),True)
+    tasks=execute('SELECT t.*,u.full_name FROM tasks t LEFT JOIN users u ON t.assigned_to=u.id WHERE t.group_id=? ORDER BY t.id DESC',(gid,),True)
+    total=len(tasks); done=sum(1 for t in tasks if t['status']=='Completed'); percent=round(done/total*100) if total else 0
+    opts=''.join(f'<option value="{m["id"]}">{m["full_name"]}</option>' for m in members)
+    html=f'''<div class="card"><h1>{g['name']}</h1><p>Group progress: {percent}%</p><div class="bar"><div class="fill" style="width:{percent}%"></div></div><h2>Add Task</h2><form method="post"><input name="title" placeholder="Task title" required><textarea name="description" placeholder="Description"></textarea><select name="assigned_to"><option value="">Unassigned</option>{opts}</select><button>Add Task</button></form></div>'''
+    for t in tasks:
+        html+=f'''<div class="card"><h3>{t['title']}</h3><p>{t['description'] or ''}</p><p>Assigned to: {t['full_name'] or 'Unassigned'}</p><p>Status: <b>{t['status']}</b> — {t['progress']}%</p><div class="bar"><div class="fill" style="width:{t['progress']}%"></div></div><form method="post" action="/task/{t['id']}"><select name="status"><option {'selected' if t['status']=='Pending' else ''}>Pending</option><option {'selected' if t['status']=='In Progress' else ''}>In Progress</option><option {'selected' if t['status']=='Completed' else ''}>Completed</option></select><input type="number" name="progress" min="0" max="100" value="{t['progress']}"><textarea name="proof" placeholder="What did you work on? / proof description"></textarea><button>Update Progress</button></form></div>'''
+    return layout(g['name'],html)
 
-        title = request.form.get("title", "").strip()
-        if not title:
-            flash("Task title is required.", "danger")
-            return redirect(url_for("group_page", group_id=group_id))
-        assigned = request.form.get("assigned_to") or None
-        if assigned:
-            try:
-                assigned = int(assigned)
-            except (TypeError, ValueError):
-                assigned = None
-            if assigned is None or not execute("SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?", (group_id, assigned), fetch=True):
-                flash("Assignee not in group.", "danger")
-                return redirect(url_for("group_page", group_id=group_id))
-        execute("""INSERT INTO tasks (group_id, title, description, assigned_to, deadline)
-                  VALUES (?, ?, ?, ?, ?)""",
-                (group_id, title, request.form.get("description", "").strip(), assigned, request.form.get("deadline", "")))
-        add_activity(group_id, user["id"], f"Created task: {title}")
-        flash("✅ Task added!", "success")
-        return redirect(url_for("group_page", group_id=group_id))
-    members = execute("SELECT u.* FROM users u JOIN group_members gm ON gm.user_id = u.id WHERE gm.group_id = ?", (group_id,), fetch=True)
-    tasks = execute("SELECT t.*, u.full_name AS assigned_name FROM tasks t LEFT JOIN users u ON u.id = t.assigned_to WHERE t.group_id = ? ORDER BY t.deadline", (group_id,), fetch=True)
-    activity = execute("SELECT a.*, u.full_name FROM activity a JOIN users u ON a.user_id = u.id WHERE a.group_id = ? ORDER BY a.created_at DESC LIMIT 30", (group_id,), fetch=True)
-    total = len(tasks)
-    completed = sum(1 for t in tasks if t["status"] == "Completed" or int(t["progress"] or 0) >= 100)
-    progress = int((completed / total) * 100) if total else 0
-
-    content = """
-<div class="hero">
-    <h1>👥 {{ group["name"] }}</h1>
-    <p>{{ group["description"] or "Group project workspace" }}</p>
-    <p class="small" style="color:white;opacity:.9;">Join Code: <strong>{{ group["join_code"] }}</strong></p>
-</div>
-<div class="cards">
-    <div class="card"><div class="stat">{{ members|length }}</div><p>Members</p></div>
-    <div class="card"><div class="stat">{{ total }}</div><p>Total Tasks</p></div>
-    <div class="card"><div class="stat">{{ completed }}</div><p>Completed</p></div>
-    <div class="card"><div class="stat">{{ progress }}%</div><p>Group Progress</p></div>
-</div>
-<div class="card">
-    <h2>📊 Group Progress</h2>
-    <div class="progress"><div class="progress-bar" style="width:{{ progress }}%;"></div></div>
-    <p>{{ completed }} of {{ total }} tasks completed.</p>
-</div>
-<div class="card">
-    <h2>➕ Create Task</h2>
-    <form method="POST">
-        <input type="hidden" name="action" value="create_task">
-        <label>Task Title</label>
-        <input name="title" placeholder="e.g. Research Chapter 1" required>
-        <label>Description</label>
-        <textarea name="description" placeholder="What needs to be done?"></textarea>
-        <label>Assign To</label>
-        <select name="assigned_to">
-            <option value="">Unassigned</option>
-            {% for member in members %}
-            <option value="{{ member["id"] }}">{{ member["full_name"] }} (@{{ member["username"] }})</option>
-            {% endfor %}
-        </select>
-        <label>Deadline</label>
-        <input type="datetime-local" name="deadline">
-        <button class="btn-primary" type="submit">Create Task</button>
-    </form>
-</div>
-<div class="card">
-    <h2>✅ Tasks</h2>
-    {% if tasks %}
-        {% for task in tasks %}
-        <div class="task">
-            <h3>{{ task["title"] }}</h3>
-            <p>{{ task["description"] or "No description." }}</p>
-            <p class="small">Assigned to: {{ task["assigned_name"] or "Unassigned" }}</p>
-            <p class="small">Deadline: {{ task["deadline"] or "No deadline" }}</p>
-            <span class="badge {% if task["status"] == "Completed" %}badge-done{% elif task["status"] == "In Progress" %}badge-progress{% else %}badge-pending{% endif %}">{{ task["status"] }}</span>
-            <strong style="float:right;">{{ task["progress"] or 0 }}%</strong>
-            <div class="progress"><div class="progress-bar" style="width:{{ task["progress"] or 0 }}%;"></div></div>
-            {% if task["proof"] %}<p><strong>Proof / Update:</strong> {{ task["proof"] }}</p>{% endif %}
-            <a class="btn btn-outline" href="{{ url_for('update_task', task_id=task['id']) }}">Update</a>
-            <form method="POST" style="display:inline;" onsubmit="return confirm('Delete this task?');">
-                <input type="hidden" name="action" value="delete_task">
-                <input type="hidden" name="task_id" value="{{ task["id"] }}">
-                <button class="btn-red" type="submit">Delete</button>
-            </form>
-        </div>
-        {% endfor %}
-    {% else %}
-        <p>No tasks yet.</p>
-    {% endif %}
-</div>
-<div class="card">
-    <h2>👨‍🎓 Members</h2>
-    {% for member in members %}
-    <p><strong>{{ member["full_name"] }}</strong> — @{{ member["username"] }}{% if member["id"] == group["owner_id"] %} <span class="badge badge-progress">OWNER</span>{% endif %}</p>
-    {% endfor %}
-</div>
-<div class="card">
-    <h2>📝 Recent Activity</h2>
-    {% if activity %}
-        {% for item in activity %}
-        <div class="activity"><strong>{{ item["full_name"] }}</strong> {{ item["message"] }}<br><span class="small">{{ item["created_at"] }}</span></div>
-        {% endfor %}
-    {% else %}<p>No activity yet.</p>{% endif %}
-</div>
-"""
-    return render_page("Group", render_template_string(content, group=group, members=members, tasks=tasks, activity=activity, progress=progress, completed=completed, total=total))
-
-# =========================================================
-# UPDATE TASK
-# =========================================================
-@app.route("/task/<int:task_id>", methods=["GET", "POST"])
+@app.route('/task/<int:task_id>',methods=['POST'])
 @login_required
 def update_task(task_id):
-    user = current_user()
-    task_result = execute("SELECT * FROM tasks WHERE id = ?", (task_id,), fetch=True)
-    if not task_result:
-        return "Task not found.", 404
-    task = task_result[0]
-    if not execute("SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?", (task["group_id"], user["id"]), fetch=True):
-        return "Unauthorized.", 403
-    if request.method == "POST":
-        try:
-            progress_value = int(request.form.get("progress", 0))
-        except (TypeError, ValueError):
-            progress_value = 0
-        progress_value = max(0, min(100, progress_value))
-        status = request.form.get("status", "Pending")
-        if status not in {"Pending", "In Progress", "Completed"}:
-            status = "Pending"
-        if progress_value >= 100:
-            status = "Completed"
-        elif progress_value > 0 and status == "Pending":
-            status = "In Progress"
-        proof = request.form.get("proof", "").strip()
-        execute("UPDATE tasks SET status = ?, progress = ?, proof = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (status, progress_value, proof, task_id))
-        add_activity(task["group_id"], user["id"], f"Updated task progress: {progress_value}%")
-        flash("Task updated successfully.", "success")
-        return redirect(url_for("group_page", group_id=task["group_id"]))
-    content = """
-<div class="card">
-    <h2>📝 Update Task</h2>
-    <h3>{{ task["title"] }}</h3>
-    <p>{{ task["description"] or "No description." }}</p>
-    <form method="POST">
-        <label>Status</label>
-        <select name="status">
-            <option value="Pending" {% if task["status"] == "Pending" %}selected{% endif %}>Pending</option>
-            <option value="In Progress" {% if task["status"] == "In Progress" %}selected{% endif %}>In Progress</option>
-            <option value="Completed" {% if task["status"] == "Completed" %}selected{% endif %}>Completed</option>
-        </select>
-        <label>Progress (%)</label>
-        <input type="number" name="progress" min="0" max="100" value="{{ task["progress"] or 0 }}" required>
-        <label>Proof / Work Update</label>
-        <textarea name="proof" placeholder="Describe what you completed...">{{ task["proof"] or "" }}</textarea>
-        <button class="btn-primary" type="submit">Save Progress</button>
-        <a class="btn btn-outline" href="{{ url_for('group_page', group_id=task['group_id']) }}">Cancel</a>
-    </form>
-</div>
-"""
-    return render_page("Update Task", render_template_string(content, task=task))
+    u=current_user(); t=execute('SELECT t.* FROM tasks t JOIN group_members m ON t.group_id=m.group_id WHERE t.id=? AND m.user_id=?',(task_id,u['id']),True,True)
+    if not t:return 'Task not found',404
+    status=request.form.get('status','Pending'); progress=max(0,min(100,int(request.form.get('progress',0) or 0))); proof=request.form.get('proof','').strip()
+    if progress==100:status='Completed'
+    execute('UPDATE tasks SET status=?,progress=?,proof=?,updated_at=CURRENT_TIMESTAMP WHERE id=?',(status,progress,proof,task_id))
+    execute('INSERT INTO activity (group_id,user_id,message) VALUES (?,?,?)',(t['group_id'],u['id'],f'Updated task: {t["title"]} ({progress}%)'))
+    return redirect(url_for('group_page',gid=t['group_id']))
 
-# =========================================================
-# ADMIN
-# =========================================================
-@app.route("/admin")
-@admin_required
+@app.route('/api/upcoming')
+@login_required
+def upcoming():
+    u=current_user(); rows=execute('SELECT id,title,schedule_date,schedule_time FROM schedules WHERE user_id=? ORDER BY schedule_date,schedule_time LIMIT 20',(u['id'],),True)
+    return jsonify([dict(x) for x in rows])
+
+@app.route('/admin',methods=['GET','POST'])
 def admin():
-    users = execute("SELECT * FROM users ORDER BY created_at DESC", fetch=True)
-    groups = execute("SELECT * FROM groups ORDER BY created_at DESC", fetch=True)
-    tasks = execute("SELECT * FROM tasks ORDER BY created_at DESC", fetch=True)
-    content = """
-<div class="hero"><h1>🛡️ Admin Dashboard</h1><p>Manage and monitor the StudySched system.</p></div>
-<div class="cards">
-    <div class="card"><div class="stat">{{ users|length }}</div><p>Users</p></div>
-    <div class="card"><div class="stat">{{ groups|length }}</div><p>Groups</p></div>
-    <div class="card"><div class="stat">{{ tasks|length }}</div><p>Tasks</p></div>
-</div>
-<div class="card">
-    <h2>👨‍🎓 Registered Users</h2>
-    {% for u in users %}
-    <div class="activity"><strong>{{ u["full_name"] }}</strong> — @{{ u["username"] }} {% if u["is_admin"] %}<span class="badge badge-progress">ADMIN</span>{% endif %}{% if u["is_premium"] %}<span class="premium-badge">PREMIUM</span>{% endif %}</div>
-    {% endfor %}
-</div>
-<div class="card">
-    <h2>👥 Groups</h2>
-    {% for g in groups %}<p><strong>{{ g["name"] }}</strong> — Code: {{ g["join_code"] }}</p>{% endfor %}
-</div>
-"""
-    return render_page("Admin", render_template_string(content, users=users, groups=groups, tasks=tasks))
+    if not (session.get('admin') or (request.form.get('username')==ADMIN_USERNAME and request.form.get('password')==ADMIN_PASSWORD)):
+        if request.method=='POST': return layout('Admin Login','<div class="card"><p class="err">Invalid admin credentials.</p><a href="/admin">Try again</a></div>')
+        return layout('Admin Login','<div class="card"><h1>Admin Login</h1><form method="post"><input name="username" placeholder="Admin username"><input type="password" name="password" placeholder="Admin password"><button>Login</button></form></div>')
+    session['admin']=True
+    users=execute('SELECT id,full_name,username,created_at FROM users ORDER BY id DESC',fetch=True)
+    groups=execute('SELECT g.id,g.name,u.full_name owner FROM groups g JOIN users u ON g.owner_id=u.id ORDER BY g.id DESC',fetch=True)
+    tasks=execute('SELECT t.id,t.title,t.status,t.progress,g.name group_name FROM tasks t JOIN groups g ON t.group_id=g.id ORDER BY t.id DESC',fetch=True)
+    html='<h1>Admin Panel</h1><div class="card"><h2>Users</h2><table><tr><th>ID</th><th>Name</th><th>Username</th></tr>'+''.join(f'<tr><td>{x["id"]}</td><td>{x["full_name"]}</td><td>{x["username"]}</td></tr>' for x in users)+'</table></div><div class="card"><h2>Groups</h2>'+''.join(f'<p><b>{x["name"]}</b> — owner: {x["owner"]}</p>' for x in groups)+'</div><div class="card"><h2>Tasks</h2>'+''.join(f'<p>{x["group_name"]}: <b>{x["title"]}</b> — {x["status"]} ({x["progress"]}%)</p>' for x in tasks)+'</div>'
+    return layout('Admin',html)
 
-# =========================================================
-# SERVICE WORKER / ICON / HEALTH
-# =========================================================
-@app.route("/sw.js")
-def service_worker():
-    return """self.addEventListener('install', event => self.skipWaiting());
-self.addEventListener('activate', event => event.waitUntil(self.clients.claim()));
-self.addEventListener('notificationclick', event => { event.notification.close(); event.waitUntil(clients.openWindow('/')); });
-""", 200, {"Content-Type": "application/javascript"}
+@app.route('/health')
+def health(): return jsonify(status='ok')
 
-@app.route("/icon.svg")
-def icon():
-    return """<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128"><rect width="128" height="128" rx="25" fill="#4f46e5"/><text x="64" y="84" font-size="62" text-anchor="middle">📚</text></svg>""", 200, {"Content-Type": "image/svg+xml"}
+@app.route('/sw.js')
+def sw():
+    return app.response_class("self.addEventListener('install',e=>self.skipWaiting());self.addEventListener('activate',e=>e.waitUntil(self.clients.claim()));",mimetype='application/javascript')
 
-@app.route("/health")
-def health():
-    try:
-        execute("SELECT 1", fetch=True)
-        return jsonify({"status": "ok"})
-    except Exception:
-        return jsonify({"status": "error"}), 500
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=os.environ.get("FLASK_DEBUG", "0") == "1")
+if __name__=='__main__':
+    app.run(host='0.0.0.0',port=int(os.environ.get('PORT',5000)))
