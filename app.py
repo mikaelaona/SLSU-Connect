@@ -12,7 +12,9 @@ except Exception:
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(32))
-DATABASE_URL = os.environ.get('DATABASE_URL', '')
+DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
+if DATABASE_URL.startswith('postgres://'):
+    DATABASE_URL = 'postgresql://' + DATABASE_URL[len('postgres://'):]
 ADMIN_USERNAME = os.environ.get('ADMIN_USERNAME', 'admin')
 ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'admin123')
 
@@ -173,7 +175,14 @@ def group_page(gid):
 def update_task(task_id):
     u=current_user(); t=execute('SELECT t.* FROM tasks t JOIN group_members m ON t.group_id=m.group_id WHERE t.id=? AND m.user_id=?',(task_id,u['id']),True,True)
     if not t:return 'Task not found',404
-    status=request.form.get('status','Pending'); progress=max(0,min(100,int(request.form.get('progress',0) or 0))); proof=request.form.get('proof','').strip()
+    status=request.form.get('status','Pending')
+    if status not in ('Pending','In Progress','Completed'):
+        status='Pending'
+    try:
+        progress=max(0,min(100,int(request.form.get('progress',0) or 0)))
+    except (TypeError,ValueError):
+        progress=0
+    proof=request.form.get('proof','').strip()
     if progress==100:status='Completed'
     execute('UPDATE tasks SET status=?,progress=?,proof=?,updated_at=CURRENT_TIMESTAMP WHERE id=?',(status,progress,proof,task_id))
     execute('INSERT INTO activity (group_id,user_id,message) VALUES (?,?,?)',(t['group_id'],u['id'],f'Updated task: {t["title"]} ({progress}%)'))
