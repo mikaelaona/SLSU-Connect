@@ -203,7 +203,7 @@ def premium_required(func):
 def is_premium_active(user):
     if not user or not user["is_premium"]:
         return False
-    if user.get("premium_until"):
+    if user["premium_until"]:
         try:
             expiry = datetime.fromisoformat(str(user["premium_until"])).replace(tzinfo=ZoneInfo("Asia/Manila"))
             return expiry > datetime.now(ZoneInfo("Asia/Manila"))
@@ -503,34 +503,88 @@ async function sendAiMsg(e) {
     body.scrollTop = body.scrollHeight;
 }
 let notificationReady = false;
+let alarmEnabled = false;
+let audioContext = null;
+
 async function enableNotifications() {
-    if (!("Notification" in window)) return;
-    if (Notification.permission === "default") {
-        notificationReady = (await Notification.requestPermission()) === "granted";
-    } else {
-        notificationReady = Notification.permission === "granted";
+    if ("Notification" in window) {
+        if (Notification.permission === "default") {
+            notificationReady = (await Notification.requestPermission()) === "granted";
+        } else {
+            notificationReady = Notification.permission === "granted";
+        }
+    }
+    try {
+        if ("serviceWorker" in navigator) await navigator.serviceWorker.register("/sw.js");
+    } catch (e) {}
+}
+
+function enableDeviceAlarm() {
+    try {
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        if (audioContext.state === "suspended") audioContext.resume();
+        alarmEnabled = true;
+        localStorage.setItem("studysched_alarm_enabled", "1");
+        beep(2);
+        alert("🔔 Device alarm enabled! Keep this StudySched tab open for the alarm to sound.");
+    } catch (e) {
+        alert("Your browser could not enable the alarm sound. Notifications may still work.");
     }
 }
+
+function beep(times = 5) {
+    if (!alarmEnabled || !audioContext) return;
+    for (let i = 0; i < times; i++) {
+        const osc = audioContext.createOscillator();
+        const gain = audioContext.createGain();
+        const t = audioContext.currentTime + i * 0.65;
+        osc.type = "sine";
+        osc.frequency.value = 880;
+        gain.gain.setValueAtTime(0.0001, t);
+        gain.gain.exponentialRampToValueAtTime(0.25, t + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.40);
+        osc.connect(gain);
+        gain.connect(audioContext.destination);
+        osc.start(t);
+        osc.stop(t + 0.45);
+    }
+}
+
 function notifyUser(title, message, key) {
-    if (!notificationReady) return;
     const storageKey = "studysched_notified_" + key;
     if (localStorage.getItem(storageKey)) return;
     localStorage.setItem(storageKey, "1");
-    if (navigator.serviceWorker?.ready) {
-        navigator.serviceWorker.ready.then(r => r.showNotification(title, {body: message, tag: key}));
-    } else { new Notification(title, {body: message}); }
+    beep(6);
+
+    if (notificationReady) {
+        if (navigator.serviceWorker && navigator.serviceWorker.ready) {
+            navigator.serviceWorker.ready.then(reg => {
+                reg.showNotification(title, {body: message, tag: key});
+            });
+        } else {
+            new Notification(title, {body: message});
+        }
+    }
+    alert("⏰ " + title + "\n\n" + message);
 }
+
 async function checkSchedules() {
     try {
         const res = await fetch("/api/upcoming", {credentials: "same-origin"});
         if (!res.ok) return;
-        (await res.json()).forEach(item => {
-            notifyUser("📚 StudySched Reminder", item.title + " is starting soon!", item.id + "_" + item.schedule_date);
+        const items = await res.json();
+        items.forEach(item => {
+            notifyUser(
+                "📚 StudySched Reminder",
+                item.title + " is starting soon!",
+                item.id + "_" + item.schedule_date + "_" + item.schedule_time
+            );
         });
-    } catch(e) {}
+    } catch (e) {}
 }
+
 enableNotifications().then(checkSchedules);
-setInterval(checkSchedules, 30000);
+setInterval(checkSchedules, 15000);
 </script>
 </body>
 </html>
@@ -851,7 +905,8 @@ def schedule():
             <option value="30">30 min before</option>
             <option value="60">1 hour before</option>
         </select>
-        <button class="btn-primary">Add Schedule</button>
+        <button class="btn-primary" type="submit">Add Schedule</button>
+        <button type="button" class="btn-outline" onclick="enableDeviceAlarm()">🔔 Enable Device Alarm</button>
     </form>
 </div>
 <div class="card">
@@ -992,4 +1047,133 @@ def group_page(group_id):
         return redirect(url_for("group_page", group_id=group_id))
     members = execute("SELECT u.* FROM users u JOIN group_members gm ON gm.user_id = u.id WHERE gm.group_id = ?", (group_id,), fetch=True)
     tasks = execute("SELECT t.*, u.full_name AS assigned_name FROM tasks t LEFT JOIN users u ON u.id = t.assigned_to WHERE t.group_id = ? ORDER BY t.deadline", (group_id,), fetch=True)
-    activity = execute("SELECT a.*, u.full_name FROM activity a JOIN users u ON a.user_id = u.id WHERE
+    activity = execute("""SELECT a.*, u.full_name
+                         FROM activity a JOIN users u ON a.user_id = u.id
+                         WHERE a.group_id = ? ORDER BY a.created_at DESC""", (group_id,), fetch=True)
+
+    member_options = "".join('<option value="{}">{}</option>'.format(m["id"], m["full_name"]) for m in members)
+    task_html = ""
+    for t in tasks:
+        progress = max(0, min(100, int(t["progress"] or 0)))
+        status_class = "badge-done" if t["status"] == "Completed" else ("badge-progress" if progress > 0 else "badge-pending")
+        task_html += """
+        <div class="task">
+            <h3>{}</h3>
+            <p>{}</p>
+            <p class="small">Assigned to: {} | Deadline: {}</p>
+            <span class="badge {}">{}</span>
+            <div class="progress"><div class="progress-bar" style="width:{}%"></div></div>
+            <p><strong>{}%</strong> complete</p>
+            <form method="POST" action="/group/{}/task/{}" style="margin-top:12px;">
+                <label>Update Progress</label>
+                <select name="progress">{}</select>
+                <label>Status</label>
+                <select name="status">{}</select>
+                <label>Proof / Update</label>
+                <textarea name="proof" placeholder="Describe what you completed...">{}</textarea>
+                <button class="btn-primary" type="submit">Save Progress</button>
+            </form>
+        </div>
+        """.format(
+            t["title"], t["description"] or "", t["assigned_name"] or "Unassigned", t["deadline"] or "No deadline",
+            status_class, t["status"], progress, progress, group_id, t["id"],
+            "".join('<option value="{}" {}>{}%</option>'.format(x, "selected" if x == progress else "", x) for x in range(0,101,10)),
+            "".join('<option value="{}" {}>{}</option>'.format(x, "selected" if x == t["status"] else "", x) for x in ["Pending","In Progress","Completed"]),
+            t["proof"] or ""
+        )
+    if not task_html:
+        task_html = '<p>No tasks yet. Add the first group task below.</p>'
+
+    activity_html = "".join(
+        '<p><strong>{}</strong> — {}<br><span class="small">{}</span></p>'.format(a["full_name"], a["message"], a["created_at"])
+        for a in activity[:15]
+    ) or '<p class="small">No activity yet.</p>'
+
+    members_html = "".join('<p>👤 {} <span class="small">@{}</span></p>'.format(m["full_name"], m["username"]) for m in members)
+    content = """
+    <div class="hero">
+        <h1>👥 {}</h1>
+        <p>{}</p>
+        <p style="margin-top:12px;"><strong>Join Code:</strong> {}</p>
+    </div>
+    <div class="cards">
+        <div class="card">
+            <h2>➕ Add Task</h2>
+            <form method="POST">
+                <label>Task</label>
+                <input name="title" required placeholder="e.g. Create Chapter 1">
+                <label>Description</label>
+                <textarea name="description" placeholder="What needs to be done?"></textarea>
+                <label>Assign to</label>
+                <select name="assigned_to"><option value="">Unassigned</option>{}</select>
+                <label>Deadline</label>
+                <input type="date" name="deadline">
+                <button class="btn-primary" type="submit">Add Task</button>
+            </form>
+        </div>
+        <div class="card"><h2>👥 Members ({})</h2>{}</div>
+    </div>
+    <div class="card"><h2>✅ Group Tasks</h2>{}</div>
+    <div class="card"><h2>📈 Recent Activity</h2>{}</div>
+    """.format(group["name"], group["description"] or "Work together, assign tasks, and track everyone's progress.", group["join_code"], member_options, len(members), members_html, task_html, activity_html)
+    return render_page(group["name"], content)
+
+@app.route("/group/<int:group_id>/task/<int:task_id>", methods=["POST"])
+@login_required
+def update_task(group_id, task_id):
+    user = current_user()
+    if not execute("SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?", (group_id, user["id"]), fetch=True):
+        return "Access denied", 403
+    task = execute("SELECT * FROM tasks WHERE id = ? AND group_id = ?", (task_id, group_id), fetch=True)
+    if not task:
+        flash("Task not found.", "danger")
+        return redirect(url_for("group_page", group_id=group_id))
+    try:
+        progress = max(0, min(100, int(request.form.get("progress", 0))))
+    except (ValueError, TypeError):
+        progress = 0
+    status = request.form.get("status", "Pending")
+    if status not in {"Pending", "In Progress", "Completed"}:
+        status = "Pending"
+    if progress == 100:
+        status = "Completed"
+    proof = request.form.get("proof", "").strip()
+    execute("UPDATE tasks SET progress = ?, status = ?, proof = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND group_id = ?", (progress, status, proof, task_id, group_id))
+    add_activity(group_id, user["id"], "Updated task progress to {}%".format(progress))
+    flash("✅ Task updated.", "success")
+    return redirect(url_for("group_page", group_id=group_id))
+
+@app.route("/admin")
+@admin_required
+def admin():
+    users = execute("SELECT id, username, full_name, is_admin, is_premium, premium_until, created_at FROM users ORDER BY created_at DESC", fetch=True)
+    schedules_count = execute("SELECT COUNT(*) AS c FROM schedules WHERE is_deleted = 0", fetch=True)[0]["c"]
+    groups_count = execute("SELECT COUNT(*) AS c FROM groups", fetch=True)[0]["c"]
+    rows = "".join("<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(u["id"], u["full_name"], u["username"], "Admin" if u["is_admin"] else "Student", "✨ Premium" if u["is_premium"] else "Free", u["premium_until"] or "—") for u in users)
+    content = """
+    <div class="hero"><h1>🛡️ Admin Dashboard</h1><p>Manage StudySched users and monitor the system.</p></div>
+    <div class="cards">
+      <div class="card"><div class="stat">{}</div><p>Users</p></div>
+      <div class="card"><div class="stat">{}</div><p>Active Schedules</p></div>
+      <div class="card"><div class="stat">{}</div><p>Groups</p></div>
+    </div>
+    <div class="card" style="overflow:auto"><h2>👤 Users</h2>
+      <table style="width:100%;border-collapse:collapse"><tr><th>ID</th><th>Name</th><th>Username</th><th>Role</th><th>Plan</th><th>Premium Until</th></tr>{}</table>
+    </div>
+    """.format(len(users), schedules_count, groups_count, rows)
+    return render_page("Admin", content)
+
+@app.route("/sw.js")
+def service_worker():
+    return """
+self.addEventListener('notificationclick', event => {
+  event.notification.close();
+  event.waitUntil(clients.matchAll({type:'window', includeUncontrolled:true}).then(list => {
+    for (const client of list) { if ('focus' in client) return client.focus(); }
+    return clients.openWindow('/schedule');
+  }));
+});
+""", 200, {"Content-Type":"application/javascript", "Cache-Control":"no-cache"}
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
